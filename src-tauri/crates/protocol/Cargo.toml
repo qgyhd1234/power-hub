@@ -1,0 +1,8 @@
+[package]
+name = "power-hub-protocol"
+version = "0.1.0"
+description = "power-hub 串口协议 v1 编解码（docs/protocol.md）"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
