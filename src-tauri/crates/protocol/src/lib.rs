@@ -1,5 +1,7 @@
 //! 串口协议 v1 编解码。规范见 `docs/protocol.md`。
 
+pub mod mock;
+
 use serde::Serialize;
 
 pub const CHANNELS: usize = 7;

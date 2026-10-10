@@ -8,7 +8,7 @@ use crate::protocol::{encode_line, parse_response, Response};
 pub const BAUD: u32 = 115_200;
 pub const READ_TIMEOUT: Duration = Duration::from_millis(200);
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum TxError {
     Timeout,
     BadLine,

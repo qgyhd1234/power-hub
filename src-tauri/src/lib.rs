@@ -48,6 +48,18 @@ fn disconnect(rt: tauri::State<Runtime>) {
 }
 
 #[tauri::command]
+async fn start_demo(rt: tauri::State<'_, Runtime>) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rt.cmd_tx
+        .send(ControlCommand::StartDemo { resp: tx })
+        .map_err(|_| "hub 轮询服务不可用".to_string())?;
+    match rx.await {
+        Ok(result) => result,
+        Err(_) => Err("hub 轮询线程无应答".into()),
+    }
+}
+
+#[tauri::command]
 async fn set_channel(ch: u8, on: bool, rt: tauri::State<'_, Runtime>) -> Result<(), String> {
     if !(1..=7).contains(&ch) {
         return Err("通道号范围 1~7".into());
@@ -120,6 +132,7 @@ pub fn run() {
             list_ports,
             connect,
             disconnect,
+            start_demo,
             set_channel,
             get_status,
             set_poll_interval,

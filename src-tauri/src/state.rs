@@ -20,6 +20,8 @@ pub struct DeviceInfo {
 
 pub struct HubState {
     pub connected: bool,
+    /// 演示模式（ADR-0004）：数据来自内置模拟器而非真实硬件
+    pub demo: bool,
     pub port: Option<String>,
     pub fw_version: Option<String>,
     pub poll_interval_ms: u64,
@@ -33,6 +35,7 @@ impl HubState {
     pub fn new() -> Self {
         Self {
             connected: false,
+            demo: false,
             port: None,
             fw_version: None,
             poll_interval_ms: 500,
@@ -75,6 +78,7 @@ pub struct ChannelStatus {
 #[serde(rename_all = "camelCase")]
 pub struct HubStatus {
     pub connected: bool,
+    pub demo: bool,
     pub port: Option<String>,
     pub fw_version: Option<String>,
     pub poll_interval_ms: u64,
@@ -109,6 +113,7 @@ pub fn snapshot(shared: &SharedState) -> HubStatus {
     let device_count = channels.iter().filter(|c| c.device.is_some()).count();
     HubStatus {
         connected: hub.connected,
+        demo: hub.demo,
         port: hub.port.clone(),
         fw_version: hub.fw_version.clone(),
         poll_interval_ms: hub.poll_interval_ms,
