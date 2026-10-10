@@ -1,0 +1,327 @@
+#!/usr/bin/env python
+"""power-hub 控制：7 通道遥测查询与电源控制。
+
+连接方式自动选择：
+1. 上位机本地 API（http://127.0.0.1:8756，需要上位机在运行且已连接 hub）
+2. 直连串口（pyserial，扫描全部串口 PING 探活，协议 v1）
+
+用法（协议规范见仓库 docs/protocol.md）：
+    uv run --with pyserial scripts/hub.py <子命令> [参数]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API_BASE = "http://127.0.0.1:8756"
+API_HEADERS = {"X-Power-Hub": "v1", "Accept": "application/json"}
+BAUD = 115200
+LINE_TIMEOUT = 1.0
+CHANNELS = 7
+
+
+class HubError(Exception):
+    pass
+
+
+# ---------- 协议 v1 编解码 ----------
+
+def checksum(payload: str) -> str:
+    acc = 0
+    for b in payload.encode("ascii"):
+        acc ^= b
+    return f"{acc:02X}"
+
+
+def encode(payload: str) -> bytes:
+    return f"{payload}*{checksum(payload)}\r\n".encode("ascii")
+
+
+def decode(raw: str) -> str | None:
+    raw = raw.strip()
+    if "*" not in raw or len(raw) > 128:
+        return None
+    payload, _, sum_hex = raw.rpartition("*")
+    if len(sum_hex) != 2:
+        return None
+    try:
+        if checksum(payload) == sum_hex.upper():
+            return payload
+    except UnicodeEncodeError:
+        return None
+    return None
+
+
+# ---------- 传输层 ----------
+
+class ApiTransport:
+    """经上位机本地 API（推荐：数据同源、含设备信息、不占串口）。"""
+
+    def __init__(self) -> None:
+        self.info = "本地 API (127.0.0.1:8756)"
+
+    def _request(self, path: str, method: str = "GET", timeout: float = 2.0) -> bytes:
+        req = urllib.request.Request(API_BASE + path, headers=API_HEADERS, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+
+    def status(self) -> dict:
+        return json.loads(self._request("/api/status").decode("utf-8"))
+
+    def set_channel(self, ch: int, on: bool) -> None:
+        action = "on" if on else "off"
+        try:
+            self._request(f"/api/channel/{ch}/{action}", method="POST", timeout=3.0)
+        except urllib.error.HTTPError as e:
+            raise HubError(f"API 返回 {e.code}: {e.read().decode('utf-8', 'replace')}") from None
+
+
+class SerialTransport:
+    """直连串口（上位机未运行时的降级路径；无设备信息）。"""
+
+    def __init__(self, port: str) -> None:
+        import serial  # 提供：uv run --with pyserial
+
+        self.port_name = port
+        self.ser = serial.Serial(port, BAUD, timeout=0.25)
+        self.info = f"直连串口 {port}"
+
+    def _transact(self, payload: str) -> str:
+        self.ser.reset_input_buffer()
+        self.ser.write(encode(payload))
+        self.ser.flush()
+        buf = b""
+        deadline = time.time() + LINE_TIMEOUT
+        while b"\n" not in buf and time.time() < deadline:
+            chunk = self.ser.read(128)
+            if chunk:
+                buf += chunk
+        text = decode(buf.decode("ascii", errors="replace"))
+        if text is None:
+            raise HubError(f"{self.port_name} 无有效应答")
+        return text
+
+    def status(self) -> dict:
+        resp = self._transact("PWR?")
+        fields = resp.split(",")
+        if fields[0] != "PWR" or len(fields) != 22:
+            raise HubError(f"PWR? 应答格式异常: {resp!r}")
+        channels = []
+        for i in range(CHANNELS):
+            sw, mv, c = fields[1 + i * 3 : 4 + i * 3]
+            voltage = int(mv) / 1000.0
+            current = int(c) / 10_000.0
+            channels.append(
+                {
+                    "index": i + 1,
+                    "on": sw == "1",
+                    "voltage": voltage,
+                    "current": current,
+                    "power": voltage * current,
+                    "history": [],
+                    "device": None,
+                }
+            )
+        return {
+            "connected": True,
+            "port": self.port_name,
+            "fwVersion": None,
+            "pollIntervalMs": None,
+            "channels": channels,
+            "totalPower": sum(c["power"] for c in channels),
+            "totalCurrent": sum(c["current"] for c in channels),
+            "deviceCount": 0,
+        }
+
+    def set_channel(self, ch: int, on: bool) -> None:
+        resp = self._transact(f"SW,{ch},{'ON' if on else 'OFF'}")
+        if resp != "OK":
+            raise HubError(f"hub 拒绝: {resp}")
+
+
+def find_transport():
+    """API 已连接则优先；否则扫描串口直连。"""
+    try:
+        t = ApiTransport()
+        if t.status().get("connected"):
+            return t
+        api_note = "API 可达但上位机未连接 hub"
+    except Exception:
+        api_note = "API 不可达（上位机未运行？）"
+
+    try:
+        import serial.tools.list_ports
+    except ImportError:
+        raise HubError(
+            f"{api_note}；直连串口需要 pyserial：uv run --with pyserial scripts/hub.py ..."
+        ) from None
+
+    errors: list[str] = []
+    for p in serial.tools.list_ports.comports():
+        t = None
+        try:
+            t = SerialTransport(p.device)
+            if t._transact("PING") == "PONG":
+                return t
+            errors.append(f"{p.device}: 无 PONG")
+        except Exception as e:
+            errors.append(f"{p.device}: {e}")
+        finally:
+            if t is not None:
+                try:
+                    t.ser.close()
+                except Exception:
+                    pass
+    detail = "；".join(errors) if errors else "系统无串口"
+    raise HubError(f"未找到 hub：{api_note}；串口探活失败（{detail}）")
+
+
+# ---------- 输出 ----------
+
+def fmt_current(a: float) -> str:
+    return f"{a * 1000:.1f} mA" if abs(a) < 0.1 else f"{a:.3f} A"
+
+
+def fmt_power(w: float) -> str:
+    return f"{w * 1000:.0f} mW" if abs(w) < 1 else f"{w:.2f} W"
+
+
+def render_status(st: dict) -> str:
+    rows = ["CH  状态  电压      电流       功率      设备"]
+    for c in st["channels"]:
+        if not c["on"]:
+            rows.append(f"{c['index']:<3} OFF  --        --         --        （断电）")
+            continue
+        dev = c.get("device")
+        dev_text = f"{dev['name']} ({dev['vid']:04X}:{dev['pid']:04X})" if dev else "（空）"
+        rows.append(
+            f"{c['index']:<3} ON   {c['voltage']:.2f} V   {fmt_current(c['current']):>8}   "
+            f"{fmt_power(c['power']):>8}  {dev_text}"
+        )
+    rows.append(
+        f"合计：功率 {fmt_power(st['totalPower'])} · 电流 {fmt_current(st['totalCurrent'])} · 设备 {st['deviceCount']}"
+    )
+    return "\n".join(rows)
+
+
+# ---------- 子命令 ----------
+
+def cmd_scan(_args: argparse.Namespace) -> None:
+    print("探测本地 API …")
+    try:
+        t = ApiTransport()
+        st = t.status()
+        if st.get("connected"):
+            print(f"  ✓ API 可达，hub 已连接：{st.get('port')}")
+        else:
+            print("  ○ API 可达，但上位机未连接 hub")
+    except Exception:
+        print("  ✗ API 不可达（上位机未运行？）")
+
+    print("扫描串口 …")
+    try:
+        import serial.tools.list_ports
+    except ImportError:
+        print("  ! 未安装 pyserial，跳过（uv run --with pyserial …）")
+        return
+    ports = [p.device for p in serial.tools.list_ports.comports()]
+    if not ports:
+        print("  ✗ 系统无串口设备")
+        return
+    for name in ports:
+        t = None
+        try:
+            t = SerialTransport(name)
+            ok = t._transact("PING") == "PONG"
+            print(f"  {'✓' if ok else '○'} {name}{'  ← power-hub' if ok else ''}")
+        except Exception as e:
+            print(f"  ✗ {name}: {e}")
+        finally:
+            if t is not None:
+                try:
+                    t.ser.close()
+                except Exception:
+                    pass
+
+
+def cmd_status(_args: argparse.Namespace) -> None:
+    t = find_transport()
+    print(f"连接：{t.info}")
+    print(render_status(t.status()))
+
+
+def cmd_set(args: argparse.Namespace, on: bool) -> None:
+    t = find_transport()
+    t.set_channel(args.ch, on)
+    ch = t.status()["channels"][args.ch - 1]
+    state = "ON" if ch["on"] else "OFF"
+    value = "--" if not ch["on"] else f"{fmt_current(ch['current'])} {fmt_power(ch['power'])}"
+    print(f"CH{args.ch} -> {state}  {value}".rstrip())
+
+
+def cmd_cycle(args: argparse.Namespace) -> None:
+    t = find_transport()
+    t.set_channel(args.ch, False)
+    print(f"CH{args.ch} 已断电，保持 {args.off_secs:g}s …")
+    time.sleep(args.off_secs)
+    t.set_channel(args.ch, True)
+    ch = t.status()["channels"][args.ch - 1]
+    state = "ON" if ch["on"] else "OFF"
+    print(f"CH{args.ch} 已重新上电：{state}")
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    t = find_transport()
+    print(f"连接：{t.info}   （Ctrl+C 停止）")
+    end = time.time() + args.seconds
+    try:
+        while time.time() < end:
+            st = t.status()
+            row = "  ".join(
+                f"CH{c['index']}{'●' if c['on'] else '○'}{fmt_current(c['current']) if c['on'] else '  --  ':>9}"
+                for c in st["channels"]
+            )
+            print(f"{time.strftime('%H:%M:%S')}  {row}  |  总 {fmt_power(st['totalPower'])}")
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="hub.py", description="power-hub 控制（协议 v1）")
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="命令")
+    sub.add_parser("scan", help="发现 hub：探测本地 API + 扫描串口")
+    sub.add_parser("status", help="7 通道遥测、开关态与设备信息")
+    p = sub.add_parser("on", help="通道上电")
+    p.add_argument("ch", metavar="CH", type=int, choices=range(1, CHANNELS + 1))
+    p = sub.add_parser("off", help="通道断电")
+    p.add_argument("ch", metavar="CH", type=int, choices=range(1, CHANNELS + 1))
+    p = sub.add_parser("cycle", help="电源循环：断电保持 N 秒后重新上电")
+    p.add_argument("ch", metavar="CH", type=int, choices=range(1, CHANNELS + 1))
+    p.add_argument("--off-secs", type=float, default=2.0)
+    p = sub.add_parser("watch", help="连续采样（秒，默认 5）")
+    p.add_argument("seconds", nargs="?", type=float, default=5.0)
+
+    args = ap.parse_args()
+    handlers = {
+        "scan": cmd_scan,
+        "status": cmd_status,
+        "on": lambda a: cmd_set(a, True),
+        "off": lambda a: cmd_set(a, False),
+        "cycle": cmd_cycle,
+        "watch": cmd_watch,
+    }
+    try:
+        handlers[args.cmd](args)
+    except HubError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
