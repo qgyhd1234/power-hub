@@ -144,6 +144,23 @@ class SerialTransport:
             raise HubError(f"hub 拒绝: {resp}")
 
 
+def is_bluetooth_port(p) -> bool:
+    """蓝牙 SPP 口打开会被 Windows 蓝牙栈阻塞数十秒，必须跳过。"""
+    desc = (p.description or "").lower()
+    return "bluetooth" in desc or "蓝牙" in desc
+
+
+def all_ports():
+    """返回 (实体口, 蓝牙口)。依赖 pyserial，未安装时抛 ImportError。"""
+    import serial.tools.list_ports
+
+    all_ = list(serial.tools.list_ports.comports())
+    return (
+        [p for p in all_ if not is_bluetooth_port(p)],
+        [p for p in all_ if is_bluetooth_port(p)],
+    )
+
+
 def find_transport():
     """API 已连接则优先；否则扫描串口直连。"""
     try:
@@ -155,14 +172,14 @@ def find_transport():
         api_note = "API 不可达（上位机未运行？）"
 
     try:
-        import serial.tools.list_ports
+        ports, _ = all_ports()
     except ImportError:
         raise HubError(
             f"{api_note}；直连串口需要 pyserial：uv run --with pyserial scripts/hub.py ..."
         ) from None
 
     errors: list[str] = []
-    for p in serial.tools.list_ports.comports():
+    for p in ports:
         t = None
         try:
             t = SerialTransport(p.device)
@@ -225,22 +242,23 @@ def cmd_scan(_args: argparse.Namespace) -> None:
 
     print("扫描串口 …")
     try:
-        import serial.tools.list_ports
+        ports, skipped = all_ports()
     except ImportError:
         print("  ! 未安装 pyserial，跳过（uv run --with pyserial …）")
         return
-    ports = [p.device for p in serial.tools.list_ports.comports()]
+    for p in skipped:
+        print(f"  - {p.device}（蓝牙口，跳过）")
     if not ports:
-        print("  ✗ 系统无串口设备")
+        print("  ✗ 无可探测的实体串口")
         return
-    for name in ports:
+    for p in ports:
         t = None
         try:
-            t = SerialTransport(name)
+            t = SerialTransport(p.device)
             ok = t._transact("PING") == "PONG"
-            print(f"  {'✓' if ok else '○'} {name}{'  ← power-hub' if ok else ''}")
+            print(f"  {'✓' if ok else '○'} {p.device}{'  ← power-hub' if ok else ''}")
         except Exception as e:
-            print(f"  ✗ {name}: {e}")
+            print(f"  ✗ {p.device}: {e}")
         finally:
             if t is not None:
                 try:
