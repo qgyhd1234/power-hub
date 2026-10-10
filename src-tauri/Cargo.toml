@@ -1,0 +1,32 @@
+[package]
+name = "power-hub"
+version = "0.1.0"
+description = "USB Hub 电源管理与可视化上位机"
+edition = "2021"
+
+[lib]
+name = "power_hub_lib"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+power-hub-protocol = { path = "crates/protocol" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = "4"
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
+futures-util = "0.3"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Devices_DeviceAndDriverInstallation",
+] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
