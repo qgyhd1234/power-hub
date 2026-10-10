@@ -19,12 +19,18 @@ export default function OverviewBar({ status, dark, onThemeToggle, onIntervalCha
         <span
           className={`ml-2 inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${
             connected
-              ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400"
+              ? status?.demo
+                ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400"
+                : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400"
               : "bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
           }`}
         >
-          <span className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-emerald-500 animate-pulse" : "bg-zinc-400"}`} />
-          {connected ? (status?.port ?? "已连接") : "未连接"}
+          <span
+            className={`h-1.5 w-1.5 rounded-full ${
+              connected ? (status?.demo ? "bg-amber-500" : "bg-emerald-500") : "bg-zinc-400"
+            } ${connected ? "animate-pulse" : ""}`}
+          />
+          {connected ? (status?.demo ? "演示模式" : (status?.port ?? "已连接")) : "未连接"}
         </span>
         {status?.fwVersion && (
           <span className="hidden font-mono text-[10px] text-zinc-400 dark:text-zinc-600 sm:inline">

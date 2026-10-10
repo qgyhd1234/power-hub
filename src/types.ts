@@ -22,6 +22,8 @@ export interface ChannelStatus {
 
 export interface HubStatus {
   connected: boolean;
+  /** 演示模式（ADR-0004）：数据来自内置模拟器 */
+  demo: boolean;
   port: string | null;
   fwVersion: string | null;
   pollIntervalMs: number;

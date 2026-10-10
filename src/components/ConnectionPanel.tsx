@@ -49,6 +49,16 @@ export default function ConnectionPanel({ onConnected }: ConnectionPanelProps) {
     }
   }
 
+  async function startDemo() {
+    setError(null);
+    try {
+      await invoke("start_demo");
+      onConnected();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-5">
       <div className="text-center">
@@ -86,6 +96,14 @@ export default function ConnectionPanel({ onConnected }: ConnectionPanelProps) {
           {connecting ? "连接中…" : "连接"}
         </button>
       </div>
+
+      <button
+        onClick={startDemo}
+        disabled={connecting}
+        className="rounded-lg border border-dashed border-zinc-300 px-4 py-1.5 text-xs text-zinc-500 transition-colors hover:border-amber-400 hover:text-amber-600 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-amber-500 dark:hover:text-amber-400"
+      >
+        没有硬件？进入演示模式 →
+      </button>
 
       {error && <p className="text-sm text-red-500">{error}</p>}
     </div>
