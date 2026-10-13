@@ -7,7 +7,7 @@ description: 通过串口/本地API控制 power-hub USB Hub（1转7 USB3.0，7�
 
 ## 概览
 
-- 硬件：1 转 7 USB3.0 hub，7 个通道的 VBUS 独立可控，串口 115200 8N1 文本行协议 v1。
+- 硬件：1 转 7 USB3.0 hub，7 个通道的 VBUS 独立可控，串口 115200 8N1 二进制帧协议。
 - **所有操作通过 `scripts/hub.py` 完成**，不要手写临时脚本。
 - 连接自动降级：优先上位机本地 API（`127.0.0.1:8756`，上位机运行中时可用，含设备信息），否则直连串口（仅遥测与开关）。
 - 统一运行前缀：`uv run --with pyserial scripts/hub.py …`
@@ -23,7 +23,7 @@ uv run --with pyserial scripts/hub.py status   # 第二步：查看现状，避�
 
 | 命令                            | 作用                                     |
 | ------------------------------- | ---------------------------------------- |
-| `scan`                          | 探测本地 API + 逐个串口 PING 探活        |
+| `scan`                          | 探测本地 API + 逐个串口握手探活         |
 | `status`                        | 7 通道遥测、开关态、设备信息             |
 | `on CH` / `off CH`              | 通道电源开关（CH = 1~7）                 |
 | `cycle CH [--off-secs N]`       | 电源循环重启（默认断电保持 2s）          |
@@ -34,7 +34,7 @@ uv run --with pyserial scripts/hub.py status   # 第二步：查看现状，避�
 1. **远程重启死机的 USB 设备**：`status` 找到通道 → `cycle 3` → `status` 确认恢复。
 2. **监控某设备功耗**：`watch 10`，观察电流/功率走势。
 3. **给某口断电保护**：`off 5` → `status` 确认该行显示 OFF。
-4. **批量下电**：逐个 `off 1` … `off 7`（协议 v1 无批量命令）。
+4. **批量下电**：逐个 `off 1` … `off 7`（二进制协议无批量命令）。
 
 ## 稳健性规则
 
