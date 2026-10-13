@@ -12,7 +12,7 @@ description: 通过串口/本地API控制 power-hub USB Hub（1转7 USB3.0，7�
 - 连接自动降级：优先上位机本地 API（`127.0.0.1:8756`，上位机运行中时可用，含设备信息），否则直连串口（仅遥测与开关）。
 - 统一运行前缀：`uv run --with pyserial scripts/hub.py …`
 
-## 会话开始：先探活
+## 会话开始：先握手识别
 
 ```bash
 uv run --with pyserial scripts/hub.py scan     # 第一步：发现 hub
@@ -23,7 +23,7 @@ uv run --with pyserial scripts/hub.py status   # 第二步：查看现状，避�
 
 | 命令                            | 作用                                     |
 | ------------------------------- | ---------------------------------------- |
-| `scan`                          | 探测本地 API + 逐个串口握手探活         |
+| `scan`                          | 探测本地 API + 逐个串口握手识别         |
 | `status`                        | 7 通道遥测、开关态、设备信息             |
 | `on CH` / `off CH`              | 通道电源开关（CH = 1~7）                 |
 | `cycle CH [--off-secs N]`       | 电源循环重启（默认断电保持 2s）          |

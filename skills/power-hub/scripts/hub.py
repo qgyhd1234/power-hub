@@ -3,7 +3,7 @@
 
 连接方式自动选择：
 1. 上位机本地 API（http://127.0.0.1:8756，需要上位机在运行且已连接 hub）
-2. 直连串口（pyserial，扫描全部串口握手探活，二进制帧协议）
+2. 直连串口（pyserial，扫描全部串口握手识别，二进制帧协议）
 
 用法（协议规范见仓库 docs/protocol.md）：
     uv run --with pyserial scripts/hub.py <子命令> [参数]
@@ -137,7 +137,8 @@ class SerialTransport:
         fw, proto, ch, sw = data
         if proto != 0x01 or ch != CHANNELS:
             return None
-        return {"fw": fw, "sw": sw}
+        # bit7 恒 0：防御性屏蔽，与协议 crate 解码层一致
+        return {"fw": fw, "sw": sw & 0x7F}
 
     def read_current(self, ch: int) -> float:
         """0x02 读通道电流，返回 mA。应答指令 = 0xF0 | 通道号，数据 = float32 小端。"""
@@ -160,12 +161,14 @@ class SerialTransport:
         channels = []
         for i in range(CHANNELS):
             ch = i + 1
-            voltage = 5.0
+            on = bool(sw & (1 << i))
+            # 电压不上传：导通恒按 5.000 V 假定（断开 0V），功率 = 5V × 电流(A)
+            voltage = 5.0 if on else 0.0
             current = self.read_current(ch) / 1000.0  # mA → A
             channels.append(
                 {
                     "index": ch,
-                    "on": bool(sw & (1 << i)),
+                    "on": on,
                     "voltage": voltage,
                     "current": current,
                     "power": voltage * current,
@@ -245,7 +248,7 @@ def find_transport():
                 except Exception:
                     pass
     detail = "；".join(errors) if errors else "系统无串口"
-    raise HubError(f"未找到 hub：{api_note}；串口探活失败（{detail}）")
+    raise HubError(f"未找到 hub：{api_note}；串口握手识别失败（{detail}）")
 
 
 # ---------- 输出 ----------

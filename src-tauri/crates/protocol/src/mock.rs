@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{parse_request, ChannelTelemetry, Request, Response, CHANNELS, CMD_FRAME_LEN, PROTO_VERSION, RESP_FRAME_LEN};
+use crate::{parse_request, ChannelTelemetry, Request, Response, CHANNELS, PROTO_VERSION, RESP_FRAME_LEN};
 
 /// 演示模式固件版本字节（协议 §4.1：fw 单字节，上位机仅透传显示）。
 pub const DEMO_FW: u8 = 0x00;
