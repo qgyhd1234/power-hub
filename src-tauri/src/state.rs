@@ -11,6 +11,9 @@ use crate::protocol::{ChannelTelemetry, CHANNELS};
 /// 电流历史窗口：500ms × 120 = 60s
 pub const HISTORY_LEN: usize = 120;
 
+/// VBUS 电压假定值：hub 不测电压，通道导通时恒按 5V 计（GLOSSARY「遥测」、ADR-0005）。
+pub const VBUS_VOLTS: f64 = 5.0;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeviceInfo {
     pub name: String,
@@ -95,8 +98,9 @@ pub fn snapshot(shared: &SharedState) -> HubStatus {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let voltage = t.mv as f64 / 1000.0;
-            let current = t.c01ma as f64 / 10_000.0;
+            // 电压不上传：通道导通恒按 5V 假定，断开为 0V；功率由上位机计算
+            let voltage = if t.sw { VBUS_VOLTS } else { 0.0 };
+            let current = t.ma as f64 / 1000.0;
             ChannelStatus {
                 index: (i + 1) as u8,
                 on: t.sw,

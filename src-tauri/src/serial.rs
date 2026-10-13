@@ -1,9 +1,9 @@
-//! 串口会话：打开、收发事务（协议 v1，一问一答）。
+//! 串口会话：打开、收发事务（二进制帧协议，一问一答）。
 
 use std::io;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{encode_line, parse_response, Response};
+use crate::protocol::{extract_response, Command, Response};
 
 pub const BAUD: u32 = 115_200;
 pub const READ_TIMEOUT: Duration = Duration::from_millis(200);
@@ -11,7 +11,6 @@ pub const READ_TIMEOUT: Duration = Duration::from_millis(200);
 #[derive(Debug, PartialEq)]
 pub enum TxError {
     Timeout,
-    BadLine,
     Io(String),
 }
 
@@ -19,7 +18,6 @@ impl std::fmt::Display for TxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TxError::Timeout => write!(f, "hub 应答超时"),
-            TxError::BadLine => write!(f, "hub 应答格式非法"),
             TxError::Io(e) => write!(f, "串口错误: {e}"),
         }
     }
@@ -39,10 +37,15 @@ impl SerialSession {
         Ok(Self { port, buf: Vec::new() })
     }
 
-    /// 发送一条命令并等待应答行（`docs/protocol.md` §2 一问一答）。
-    pub fn transact(&mut self, payload: &str) -> Result<Response, TxError> {
-        let line = encode_line(payload);
-        let mut out = line.as_bytes();
+    /// 发送一条命令并等待应答帧（`docs/protocol.md` §2 一问一答）。
+    ///
+    /// 严格一问一答下不存在对端主动数据，事务开始时丢弃上次遗留的
+    /// 未完成字节，避免上一条超时命令的迟到应答污染本次解析。
+    /// 非法帧由解析层静默丢弃，这里只会以超时告终。
+    pub fn transact(&mut self, command: &Command) -> Result<Response, TxError> {
+        self.buf.clear();
+        let frame = command.encode();
+        let mut out: &[u8] = &frame;
         while !out.is_empty() {
             match self.port.write(out) {
                 Ok(0) => return Err(TxError::Io("串口写入 0 字节".into())),
@@ -55,14 +58,8 @@ impl SerialSession {
 
         let deadline = Instant::now() + READ_TIMEOUT;
         loop {
-            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-                let raw: Vec<u8> = self.buf.drain(..=pos).collect();
-                let text = String::from_utf8_lossy(&raw);
-                let text = text.trim_end_matches(['\r', '\n']);
-                if text.is_empty() {
-                    continue;
-                }
-                return parse_response(text).ok_or(TxError::BadLine);
+            if let Some(resp) = extract_response(&mut self.buf) {
+                return Ok(resp);
             }
             if Instant::now() >= deadline {
                 return Err(TxError::Timeout);
@@ -86,3 +83,6 @@ pub fn list_ports() -> Vec<String> {
         .map(|p| p.port_name)
         .collect()
 }
+
+// 写帧依赖 Command::encode 的定长布局，这里把规范帧长锁进编译期。
+const _: () = assert!(crate::protocol::CMD_FRAME_LEN == 4, "上位机→hub 帧长按规范为 4 字节");

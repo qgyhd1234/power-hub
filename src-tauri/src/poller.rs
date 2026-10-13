@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tauri::Emitter;
 use tokio::sync::oneshot;
 
-use crate::protocol::{Response, CHANNELS};
+use crate::protocol::{Command, Response, ChannelTelemetry, CHANNELS};
 use crate::serial::{SerialSession, TxError};
 use crate::state::{self, SharedState, HISTORY_LEN};
 use power_hub_protocol::mock::{DemoDevice, MockHub, DEMO_FW};
@@ -26,11 +26,14 @@ enum Session {
 }
 
 impl Session {
-    fn transact(&mut self, payload: &str) -> Result<Response, TxError> {
+    fn transact(&mut self, command: &Command) -> Result<Response, TxError> {
         match self {
-            Session::Serial(s) => s.transact(payload),
-            // 虚拟 hub 对一切合法命令都有应答；None 不会出现
-            Session::Mock(m) => m.transact(payload).ok_or(TxError::BadLine),
+            Session::Serial(s) => s.transact(command),
+            // 虚拟 hub 对一切合法命令都有应答；None/不可解码不会出现
+            Session::Mock(m) => {
+                let frame = m.handle(&command.encode()).ok_or(TxError::Timeout)?;
+                crate::protocol::decode_response(&frame).ok_or(TxError::Timeout)
+            }
         }
     }
 }
@@ -60,25 +63,28 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
             match cmd {
                 ControlCommand::Connect { path, resp } => {
                     match SerialSession::open(&path) {
-                        Ok(mut s) => {
-                            let fw = s.transact("VER?").ok().and_then(|r| match r {
-                                Response::Ver { fw, .. } => Some(fw),
-                                _ => None,
-                            });
-                            {
-                                let mut hub = shared.hub.write().expect("HubState 锁中毒");
-                                hub.connected = true;
-                                hub.demo = false;
-                                hub.port = Some(path);
-                                hub.fw_version = fw.clone();
+                        Ok(mut s) => match connect_handshake(&mut s) {
+                            Ok((fw, switches)) => {
+                                {
+                                    let mut hub = shared.hub.write().expect("HubState 锁中毒");
+                                    hub.connected = true;
+                                    hub.demo = false;
+                                    hub.port = Some(path.clone());
+                                    hub.fw_version = Some(format!("0x{fw:02X}"));
+                                    // 握手应答带回通道状态：连接瞬间同步 UI（规范 §4.1）
+                                    apply_switches(&mut hub.telemetry, switches);
+                                }
+                                failures = 0;
+                                next_poll = Instant::now();
+                                state::notify(&shared);
+                                emit(&handle, &shared);
+                                let _ = resp.send(Ok(Some(format!("0x{fw:02X}"))));
+                                session = Some(Session::Serial(s));
                             }
-                            failures = 0;
-                            next_poll = Instant::now();
-                            state::notify(&shared);
-                            emit(&handle, &shared);
-                            let _ = resp.send(Ok(fw));
-                            session = Some(Session::Serial(s));
-                        }
+                            Err(reason) => {
+                                let _ = resp.send(Err(format!("{path}: {reason}")));
+                            }
+                        },
                         Err(e) => {
                             let _ = resp.send(Err(e));
                         }
@@ -91,7 +97,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                         hub.connected = true;
                         hub.demo = true;
                         hub.port = Some("演示模式".into());
-                        hub.fw_version = Some(DEMO_FW.into());
+                        hub.fw_version = Some(format!("0x{DEMO_FW:02X}"));
                     }
                     failures = 0;
                     next_poll = Instant::now();
@@ -109,16 +115,24 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                         let _ = resp.send(Err("未连接 hub".into()));
                     }
                     Some(s) => {
-                        let arg = if on { "ON" } else { "OFF" };
-                        let result = match s.transact(&format!("SW,{ch},{arg}")) {
-                            Ok(Response::Ok) => Ok(()),
-                            Ok(Response::Err { code, msg }) => Err(format!("hub 报错 {code}: {msg}")),
-                            Ok(_) => Err("hub 应答异常".into()),
-                            Err(e) => Err(e.to_string()),
+                        let result = match Command::set_channel(ch, on) {
+                            None => Err("通道号范围 1~7".into()),
+                            Some(command) => match s.transact(&command) {
+                                // 应答掩码即动作执行后的全通道状态（规范 §4.2）
+                                Ok(Response::Switches(mask)) => {
+                                    {
+                                        let mut hub = shared.hub.write().expect("HubState 锁中毒");
+                                        apply_switches(&mut hub.telemetry, mask);
+                                    }
+                                    state::notify(&shared);
+                                    emit(&handle, &shared);
+                                    next_poll = Instant::now();
+                                    Ok(())
+                                }
+                                Ok(_) => Err("hub 应答异常".into()),
+                                Err(e) => Err(e.to_string()),
+                            },
                         };
-                        if result.is_ok() {
-                            next_poll = Instant::now();
-                        }
                         let _ = resp.send(result);
                     }
                 },
@@ -137,7 +151,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
             next_poll = Instant::now() + interval;
         }
         if now >= next_usb {
-            // 演示模式的设备表随每轮 PWR? 注入（见 poll_once），不走系统枚举
+            // 演示模式的设备表随每轮轮询注入（见 poll_once），不走系统枚举
             if matches!(session, Some(Session::Serial(_))) {
                 #[cfg(windows)]
                 if let Ok(map) = crate::usb::enumerate_channels() {
@@ -155,43 +169,67 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
     }
 }
 
+/// 连接握手（规范 §4.1）：发 0x00 并按判据识别；通过则返回 (fw, 状态掩码)。
+fn connect_handshake(s: &mut SerialSession) -> Result<(u8, u8), String> {
+    match s.transact(&Command::Handshake) {
+        Ok(resp @ Response::Handshake { fw, switches, .. }) if resp.is_valid_handshake() => {
+            Ok((fw, switches))
+        }
+        Ok(_) => Err("不是 power-hub（握手判据不符）".into()),
+        Err(e) => Err(format!("握手失败：{e}")),
+    }
+}
+
+fn apply_switches(telemetry: &mut [ChannelTelemetry; CHANNELS], mask: u8) {
+    for (i, t) in telemetry.iter_mut().enumerate() {
+        t.sw = mask & (1 << i) != 0;
+    }
+}
+
 fn poll_once(
     handle: &tauri::AppHandle,
     shared: &SharedState,
     session: &mut Session,
     failures: &mut u32,
 ) {
-    match session.transact("PWR?") {
-        Ok(Response::Pwr(telemetry)) => {
-            *failures = 0;
-            {
-                let mut hub = shared.hub.write().expect("HubState 锁中毒");
-                hub.connected = true;
-                for (i, t) in telemetry.iter().enumerate().take(CHANNELS) {
-                    hub.telemetry[i] = *t;
-                    let hist = &mut hub.histories[i];
-                    hist.push_back(t.c01ma as f64 / 10_000.0);
-                    while hist.len() > HISTORY_LEN {
-                        hist.pop_front();
-                    }
-                }
-                if let Session::Mock(m) = session {
-                    hub.devices = m.device_infos().map(|slot| {
-                        slot.map(|d: DemoDevice| state::DeviceInfo {
-                            name: d.name.into(),
-                            vid: d.vid,
-                            pid: d.pid,
-                        })
-                    });
-                }
+    // 一轮 = 依次读 7 个通道电流（规范 §7）；全部成功才提交，
+    // 任一事务失败该轮计 1 次失败，通道开关态由握手/设置应答维护、不单独轮询。
+    let mut currents = [0.0f32; CHANNELS];
+    for channel in 1..=CHANNELS as u8 {
+        match session.transact(&Command::ReadCurrent { channel }) {
+            Ok(Response::Current { channel: ch, ma }) if ch == channel => {
+                currents[(ch - 1) as usize] = ma;
             }
-            state::notify(shared);
-            emit(handle, shared);
-        }
-        Ok(_) | Err(_) => {
-            *failures += 1;
+            _ => {
+                *failures += 1;
+                return;
+            }
         }
     }
+    *failures = 0;
+    {
+        let mut hub = shared.hub.write().expect("HubState 锁中毒");
+        hub.connected = true;
+        for (i, ma) in currents.into_iter().enumerate() {
+            hub.telemetry[i].ma = ma;
+            let hist = &mut hub.histories[i];
+            hist.push_back(ma as f64 / 1000.0);
+            while hist.len() > HISTORY_LEN {
+                hist.pop_front();
+            }
+        }
+        if let Session::Mock(m) = session {
+            hub.devices = m.device_infos().map(|slot| {
+                slot.map(|d: DemoDevice| state::DeviceInfo {
+                    name: d.name.into(),
+                    vid: d.vid,
+                    pid: d.pid,
+                })
+            });
+        }
+    }
+    state::notify(shared);
+    emit(handle, shared);
 }
 
 fn mark_disconnected(shared: &SharedState) {
