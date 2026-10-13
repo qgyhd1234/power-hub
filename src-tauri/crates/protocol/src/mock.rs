@@ -1,15 +1,15 @@
-//! 虚拟 hub（演示模式，ADR-0004）：按协议 v1 应答的参考模拟器，遥测由模拟生成。
+//! 虚拟 hub（演示模式，ADR-0004）：按二进制帧协议应答的参考实现，遥测由模拟生成。
 //!
-//! 模拟行为：电压 5V 微波动；电流带噪声与缓慢漂移；4 个常驻虚拟设备
-//! （真实 VID/PID）；每 20~40 秒随机插拔一个设备；`SW` 命令即时生效。
+//! 模拟行为：电流带噪声与缓慢漂移；4 个常驻虚拟设备（真实 VID/PID）；
+//! 每 20~40 秒随机插拔一个设备；通道开关即时生效。
 //! 放在协议 crate 内，使协议单测与演示模式都不依赖 tauri 运行时。
 
 use std::time::{Duration, Instant};
 
-use crate::{ChannelTelemetry, Response, CHANNELS};
+use crate::{parse_request, ChannelTelemetry, Request, Response, CHANNELS, CMD_FRAME_LEN, PROTO_VERSION, RESP_FRAME_LEN};
 
-/// 演示模式固件版本标识。
-pub const DEMO_FW: &str = "0.9.0-demo";
+/// 演示模式固件版本字节（协议 §4.1：fw 单字节，上位机仅透传显示）。
+pub const DEMO_FW: u8 = 0x00;
 
 /// 模拟端口上的虚拟设备信息（演示模式下供上位机展示）。
 #[derive(Debug, Clone, PartialEq)]
@@ -104,7 +104,7 @@ impl MockHub {
         }
     }
 
-    /// 每次被轮询时推进模拟：随机插拔事件 + 电流平滑演化。
+    /// 每次被请求时推进模拟：随机插拔事件 + 电流平滑演化。
     fn tick(&mut self) {
         if Instant::now() >= self.next_event {
             self.random_plug_event();
@@ -139,21 +139,28 @@ impl MockHub {
         }
     }
 
-    /// 当前模拟遥测。
-    fn telemetry(&mut self) -> [ChannelTelemetry; CHANNELS] {
-        std::array::from_fn(|i| {
-            let c = &self.channels[i];
-            if !c.on {
-                return ChannelTelemetry { sw: false, mv: 0, c01ma: 0 };
-            }
-            let wave = 0.06 * c.phase.sin() + 1.0;
-            let noise = 1.0 + (self.rng.next() - 0.5) * 0.05;
-            let amps = (self.last_current[i] * wave * noise).max(0.0);
-            let load_drop = (amps * 22.0) as u32; // 负载压降 mV
-            let ripple = (self.rng.next() - 0.5) * 12.0;
-            let mv = (5020.0 - load_drop as f64 + ripple).clamp(4900.0, 5120.0) as u32;
-            ChannelTelemetry { sw: true, mv, c01ma: (amps * 10_000.0).round() as u32 }
-        })
+    /// 7 通道电源状态掩码（bit0 = 通道 1）。
+    fn switches(&self) -> u8 {
+        self.channels.iter().enumerate().fold(
+            0u8,
+            |acc, (i, c)| if c.on { acc | (1 << i) } else { acc },
+        )
+    }
+
+    /// 当前通道模拟电流（mA）。
+    fn current_ma(&mut self, ch: usize) -> f32 {
+        let c = &self.channels[ch];
+        if !c.on {
+            return 0.0;
+        }
+        let wave = 0.06 * c.phase.sin() + 1.0;
+        let noise = 1.0 + (self.rng.next() - 0.5) * 0.05;
+        ((self.last_current[ch] * wave * noise).max(0.0) * 1000.0) as f32
+    }
+
+    /// 当前模拟遥测（开关态 + 电流；电压不上传）。
+    pub fn telemetry(&mut self) -> [ChannelTelemetry; CHANNELS] {
+        std::array::from_fn(|i| ChannelTelemetry { sw: self.channels[i].on, ma: self.current_ma(i) })
     }
 
     /// 供上位机注入共享状态的设备表。
@@ -169,82 +176,95 @@ impl MockHub {
 }
 
 impl MockHub {
-    /// 与 `SerialSession::transact` 同构：收到 payload，返回协议应答。
-    pub fn transact(&mut self, payload: &str) -> Option<Response> {
+    /// 处理一帧 4 字节请求，返回 7 字节应答帧。
+    /// 请求非法（静默丢弃语义，规范 §6）返回 `None`，不应答。
+    pub fn handle(&mut self, request_frame: &[u8]) -> Option<[u8; RESP_FRAME_LEN]> {
+        let request = parse_request(request_frame)?;
         self.tick();
-        let response = match payload {
-            "PING" => Response::Pong,
-            "PWR?" => Response::Pwr(self.telemetry()),
-            "VER?" => Response::Ver { fw: DEMO_FW.into(), proto: 1, channels: CHANNELS as u8 },
-            _ => {
-                if let Some(rest) = payload.strip_prefix("SW,") {
-                    let mut parts = rest.split(',');
-                    let ch = parts.next().and_then(|s| s.parse::<u8>().ok());
-                    let action = parts.next().unwrap_or("");
-                    match (ch, action) {
-                        (Some(ch), "ON") if (1..=CHANNELS as u8).contains(&ch) => {
-                            self.channels[(ch - 1) as usize].on = true;
-                            Response::Ok
-                        }
-                        (Some(ch), "OFF") if (1..=CHANNELS as u8).contains(&ch) => {
-                            self.channels[(ch - 1) as usize].on = false;
-                            Response::Ok
-                        }
-                        (Some(_), "ON" | "OFF") => {
-                            Response::Err { code: 3, msg: "channel out of range".into() }
-                        }
-                        _ => Response::Err { code: 2, msg: "bad SW arguments".into() },
-                    }
-                } else {
-                    Response::Err { code: 1, msg: "unknown command".into() }
-                }
+        let response = match request {
+            Request::Handshake => Response::Handshake {
+                fw: DEMO_FW,
+                proto: PROTO_VERSION,
+                channels: CHANNELS as u8,
+                switches: self.switches(),
+            },
+            Request::SetChannel { channel, on } => {
+                self.channels[(channel - 1) as usize].on = on;
+                Response::Switches(self.switches())
             }
+            Request::ReadCurrent { channel } => Response::Current {
+                channel,
+                ma: self.current_ma((channel - 1) as usize),
+            },
         };
-        Some(response)
+        Some(response.encode())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{cmd, decode_response, Command, CMD_FRAME_LEN};
+
+    /// 环回辅助：发原始请求帧，解出应答。
+    fn ask(hub: &mut MockHub, request: &[u8]) -> Response {
+        decode_response(&hub.handle(request).expect("合法请求必有应答")).expect("应答可解码")
+    }
+
+    fn cmd_frame(command: &Command) -> [u8; CMD_FRAME_LEN] {
+        command.encode()
+    }
 
     #[test]
-    fn demo_responds_like_a_hub() {
+    fn handshake_identifies_as_hub() {
         let mut hub = MockHub::new();
-        assert_eq!(hub.transact("PING"), Some(Response::Pong));
-        match hub.transact("PWR?") {
-            Some(Response::Pwr(t)) => {
-                assert_eq!(t.len(), 7);
-                assert!(t[0].sw, "初始布景 CH1 有设备且上电");
-                assert!(t[0].c01ma > 0);
-            }
-            other => panic!("期望 Pwr，实际 {other:?}"),
-        }
-        match hub.transact("VER?") {
-            Some(Response::Ver { fw, proto, channels }) => {
+        let resp = ask(&mut hub, &cmd_frame(&Command::Handshake));
+        assert!(resp.is_valid_handshake(), "演示 hub 必须通过识别判据");
+        match resp {
+            Response::Handshake { fw, switches, .. } => {
                 assert_eq!(fw, DEMO_FW);
-                assert_eq!((proto, channels), (1, 7));
+                assert_eq!(switches, 0x7F, "初始 7 通道全开");
             }
-            other => panic!("期望 Ver，实际 {other:?}"),
+            other => panic!("期望 Handshake，实际 {other:?}"),
         }
     }
 
     #[test]
-    fn demo_switch_takes_effect_immediately() {
+    fn full_flow_handshake_set_read() {
         let mut hub = MockHub::new();
-        assert_eq!(hub.transact("SW,1,OFF"), Some(Response::Ok));
-        match hub.transact("PWR?") {
-            Some(Response::Pwr(t)) => assert!(!t[0].sw && t[0].c01ma == 0),
-            other => panic!("期望 Pwr，实际 {other:?}"),
+        // 握手 → 关通道 1 → 读通道 1 电流为 0，读通道 2 有设备电流 > 0
+        assert!(ask(&mut hub, &cmd_frame(&Command::Handshake)).is_valid_handshake());
+        assert_eq!(
+            ask(&mut hub, &cmd_frame(&Command::set_channel(1, false).unwrap())),
+            Response::Switches(0x7E)
+        );
+        assert_eq!(
+            ask(&mut hub, &cmd_frame(&Command::read_current(1).unwrap())),
+            Response::Current { channel: 1, ma: 0.0 }
+        );
+        match ask(&mut hub, &cmd_frame(&Command::read_current(2).unwrap())) {
+            Response::Current { channel: 2, ma } => assert!(ma > 0.0),
+            other => panic!("期望 Current，实际 {other:?}"),
         }
-        assert_eq!(hub.transact("SW,1,ON"), Some(Response::Ok));
-        assert_eq!(
-            hub.transact("SW,9,ON"),
-            Some(Response::Err { code: 3, msg: "channel out of range".into() })
-        );
-        assert_eq!(
-            hub.transact("SW,x,ON"),
-            Some(Response::Err { code: 2, msg: "bad SW arguments".into() })
-        );
+    }
+
+    #[test]
+    fn invalid_requests_are_silently_dropped() {
+        let mut hub = MockHub::new();
+        assert_eq!(hub.handle(&[]), None, "空帧");
+        assert_eq!(hub.handle(&[0xA5, 0x00, 0x00]), None, "长度不足");
+        assert_eq!(hub.handle(&[0xA5, 0x00, 0x00, 0x00]), None, "包尾不对");
+        assert_eq!(hub.handle(&[0xA5, 0x03, 0x00, 0x5A]), None, "未知指令");
+        assert_eq!(hub.handle(&[0xA5, 0x01, 0x00, 0x5A]), None, "设置通道 0");
+        assert_eq!(hub.handle(&[0xA5, 0x02, 0x08, 0x5A]), None, "读通道 8");
+    }
+
+    #[test]
+    fn response_frames_have_framing_bytes() {
+        let mut hub = MockHub::new();
+        let frame = hub.handle(&cmd_frame(&Command::Handshake)).unwrap();
+        assert_eq!(frame[0], crate::FRAME_HEAD);
+        assert_eq!(frame[6], crate::FRAME_TAIL);
+        assert_eq!(frame[1], cmd::HANDSHAKE);
     }
 }
