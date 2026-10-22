@@ -1,6 +1,7 @@
 //! power-hub 上位机：Tauri 2 应用组装与对外命令。
 
 mod api;
+mod config;
 mod magic;
 mod poller;
 mod serial;
@@ -44,18 +45,15 @@ fn usable_log_dir(candidate: PathBuf) -> Option<PathBuf> {
     Some(candidate)
 }
 
-/// 日志目录解析：exe 旁 `logs/` → 系统本地数据目录 → 临时目录。
-/// exe 被放进 Program Files 等不可写位置时自动降级，保证总能拿到目录。
-fn resolve_log_dir(
+/// 应用数据目录解析：exe 旁 → 系统本地数据目录 → 临时目录。
+/// exe 被放进 Program Files 等不可写位置时自动降级，保证总能拿到可写目录；
+/// 日志在其 `logs/` 子目录，配置文件为 `config.json`。
+fn resolve_app_dir(
     exe_dir: Option<PathBuf>,
     local_data_root: Option<PathBuf>,
     temp_root: PathBuf,
 ) -> PathBuf {
-    let candidates = [
-        exe_dir.map(|d| d.join("logs")),
-        local_data_root.map(|d| d.join(APP_IDENTIFIER).join("logs")),
-        Some(temp_root.join("logs")),
-    ];
+    let candidates = [exe_dir, local_data_root.map(|d| d.join(APP_IDENTIFIER)), Some(temp_root)];
     candidates
         .into_iter()
         .flatten()
@@ -76,6 +74,8 @@ fn local_data_root() -> Option<PathBuf> {
 pub struct Runtime {
     shared: SharedState,
     cmd_tx: mpsc::Sender<ControlCommand>,
+    /// 应用数据目录（config.json 所在处），命令保存配置时使用
+    app_dir: PathBuf,
 }
 
 #[tauri::command]
@@ -132,12 +132,35 @@ fn get_status(rt: tauri::State<Runtime>) -> state::HubStatus {
     state::snapshot(&rt.shared)
 }
 
+/// 两个轮询间隔改动后落盘（写失败仅记日志，不打断交互）。
+fn persist_intervals(rt: &Runtime) {
+    let hub = rt.shared.hub.read().expect("HubState 锁中毒");
+    let cfg = config::AppConfig {
+        poll_interval_ms: hub.poll_interval_ms,
+        status_poll_interval_ms: hub.status_poll_interval_ms,
+    };
+    drop(hub);
+    if let Err(e) = config::save(&rt.app_dir, &cfg) {
+        error!("配置保存失败: {e}");
+    }
+}
+
 #[tauri::command]
 fn set_poll_interval(ms: u64, rt: tauri::State<Runtime>) {
-    let ms = ms.clamp(200, 5_000);
+    let ms = config::clamp_poll_interval(ms);
     if let Ok(mut hub) = rt.shared.hub.write() {
         hub.poll_interval_ms = ms;
     }
+    persist_intervals(&rt);
+}
+
+#[tauri::command]
+fn set_status_poll_interval(ms: u64, rt: tauri::State<Runtime>) {
+    let ms = config::clamp_status_interval(ms);
+    if let Ok(mut hub) = rt.shared.hub.write() {
+        hub.status_poll_interval_ms = ms;
+    }
+    persist_intervals(&rt);
 }
 
 #[tauri::command]
@@ -163,7 +186,9 @@ pub fn run() {
     let level = if verbose { log::LevelFilter::Debug } else { log::LevelFilter::Info };
     let exe_dir =
         std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let log_dir = resolve_log_dir(exe_dir, local_data_root(), std::env::temp_dir());
+    let app_dir = resolve_app_dir(exe_dir, local_data_root(), std::env::temp_dir());
+    let log_dir = app_dir.join("logs");
+    let (app_config, config_from_file) = config::load(&app_dir);
 
     tauri::Builder::default()
         .plugin(
@@ -185,16 +210,25 @@ pub fn run() {
             std::panic::set_hook(Box::new(|info| {
                 error!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
             }));
+            let _ = std::fs::create_dir_all(&log_dir);
             info!(
-                "power-hub v{} 启动 | 日志目录: {} | verbose: {verbose}",
+                "power-hub v{} 启动 | 日志目录: {} | 轮询: 电流 {}ms / 状态 {}ms（{}） | verbose: {verbose}",
                 env!("CARGO_PKG_VERSION"),
-                log_dir.display()
+                log_dir.display(),
+                app_config.poll_interval_ms,
+                app_config.status_poll_interval_ms,
+                if config_from_file { "配置文件" } else { "默认值" },
             );
 
             let handle = app.handle().clone();
             let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>();
             let shared: SharedState = Arc::new(state::SharedInner {
-                hub: RwLock::new(state::HubState::new()),
+                hub: RwLock::new({
+                    let mut hub_state = state::HubState::new();
+                    hub_state.poll_interval_ms = app_config.poll_interval_ms;
+                    hub_state.status_poll_interval_ms = app_config.status_poll_interval_ms;
+                    hub_state
+                }),
                 updated: watch::channel(()).0,
             });
 
@@ -212,7 +246,7 @@ pub fn run() {
                 });
             }
 
-            app.manage(Runtime { shared, cmd_tx });
+            app.manage(Runtime { shared, cmd_tx, app_dir: app_dir.clone() });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -223,6 +257,7 @@ pub fn run() {
             set_channel,
             get_status,
             set_poll_interval,
+            set_status_poll_interval,
             refresh_devices
         ])
         .run(tauri::generate_context!())
@@ -241,10 +276,10 @@ mod log_support_tests {
     }
 
     #[test]
-    fn prefers_writable_logs_next_to_exe() {
+    fn prefers_writable_dir_next_to_exe() {
         let root = temp_root("exe-ok");
-        let resolved = resolve_log_dir(Some(root.clone()), Some(root.join("data")), root.join("tmp"));
-        assert_eq!(resolved, root.join("logs"));
+        let resolved = resolve_app_dir(Some(root.clone()), Some(root.join("data")), root.join("tmp"));
+        assert_eq!(resolved, root);
         assert!(resolved.is_dir());
     }
 
@@ -255,15 +290,14 @@ mod log_support_tests {
         std::fs::create_dir_all(&root).unwrap();
         let blocker = root.join("not-a-dir");
         std::fs::write(&blocker, b"x").unwrap();
-        let resolved = resolve_log_dir(Some(blocker), Some(root.clone()), root.join("tmp"));
-        assert_eq!(resolved, root.join("data").join("dev.powerhub.app").join("logs"));
+        let resolved = resolve_app_dir(Some(blocker), Some(root.clone()), root.join("tmp"));
+        assert_eq!(resolved, root.join("data").join("dev.powerhub.app"));
         assert!(resolved.is_dir());
     }
 
     #[test]
     fn falls_back_to_temp_when_nothing_given() {
-        let resolved = resolve_log_dir(None, None, temp_root("no-exe"));
-        assert!(resolved.ends_with("logs"));
+        let resolved = resolve_app_dir(None, None, temp_root("no-exe"));
         assert!(resolved.is_dir());
     }
 

@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::config;
 use crate::protocol::{ChannelTelemetry, CHANNELS};
 
 /// 电流历史窗口：500ms × 120 = 60s
@@ -28,6 +29,8 @@ pub struct HubState {
     pub port: Option<String>,
     pub fw_version: Option<String>,
     pub poll_interval_ms: u64,
+    /// 状态轮询间隔（毫秒）；0 = 禁用状态轮询
+    pub status_poll_interval_ms: u64,
     pub telemetry: [ChannelTelemetry; CHANNELS],
     /// 每通道电流（单位 A）历史，最旧在前
     pub histories: [VecDeque<f64>; CHANNELS],
@@ -41,7 +44,8 @@ impl HubState {
             demo: false,
             port: None,
             fw_version: None,
-            poll_interval_ms: 500,
+            poll_interval_ms: config::DEFAULT_POLL_INTERVAL_MS,
+            status_poll_interval_ms: config::DEFAULT_STATUS_INTERVAL_MS,
             telemetry: [ChannelTelemetry::default(); CHANNELS],
             histories: std::array::from_fn(|_| VecDeque::with_capacity(HISTORY_LEN)),
             devices: std::array::from_fn(|_| None),
@@ -85,6 +89,7 @@ pub struct HubStatus {
     pub port: Option<String>,
     pub fw_version: Option<String>,
     pub poll_interval_ms: u64,
+    pub status_poll_interval_ms: u64,
     pub channels: Vec<ChannelStatus>,
     pub total_power: f64,
     pub total_current: f64,
@@ -121,6 +126,7 @@ pub fn snapshot(shared: &SharedState) -> HubStatus {
         port: hub.port.clone(),
         fw_version: hub.fw_version.clone(),
         poll_interval_ms: hub.poll_interval_ms,
+        status_poll_interval_ms: hub.status_poll_interval_ms,
         channels,
         total_power,
         total_current,

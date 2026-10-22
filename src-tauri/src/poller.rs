@@ -19,8 +19,6 @@ use power_hub_protocol::mock::{DemoDevice, MockHub, DEMO_FW};
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// 设备树枚举节流周期。
 const USB_REFRESH: Duration = Duration::from_secs(2);
-/// 状态轮询周期：hub 无主动上报，周期 0x00 感知手动控制等带外变化（protocol.md §4.1）。
-const STATUS_POLL: Duration = Duration::from_secs(3);
 
 /// 与 hub 的会话：真实串口或演示模式（ADR-0004）。
 enum Session {
@@ -81,7 +79,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                                 }
                                 failures = 0;
                                 next_poll = Instant::now();
-                                next_status = Instant::now() + STATUS_POLL;
+                                next_status = Instant::now() + status_poll_interval(&shared);
                                 state::notify(&shared);
                                 emit(&handle, &shared);
                                 let _ = resp.send(Ok(Some(format!("0x{fw:02X}"))));
@@ -110,7 +108,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                     }
                     failures = 0;
                     next_poll = Instant::now();
-                    next_status = Instant::now() + STATUS_POLL;
+                    next_status = Instant::now() + status_poll_interval(&shared);
                     state::notify(&shared);
                     emit(&handle, &shared);
                     let _ = resp.send(Ok(()));
@@ -157,17 +155,21 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
         let now = Instant::now();
         let connected = session.is_some();
         if connected && now >= next_status {
-            match session.as_mut().expect("connected").transact(&Command::Handshake) {
-                Ok(resp @ Response::Handshake { switches, .. }) if resp.is_valid_handshake() => {
-                    failures = 0;
-                    commit_switches(&handle, &shared, switches);
-                }
-                _ => {
-                    warn!("状态轮询失败，计 1 次失败");
-                    failures += 1;
+            let status_ms = shared.hub.read().expect("HubState 锁中毒").status_poll_interval_ms;
+            if status_ms > 0 {
+                match session.as_mut().expect("connected").transact(&Command::Handshake) {
+                    Ok(resp @ Response::Handshake { switches, .. }) if resp.is_valid_handshake() => {
+                        failures = 0;
+                        commit_switches(&handle, &shared, switches);
+                    }
+                    _ => {
+                        warn!("状态轮询失败，计 1 次失败");
+                        failures += 1;
+                    }
                 }
             }
-            next_status = now + STATUS_POLL;
+            // 禁用（0）时只按 1 秒节拍重查配置，不发送任何 0x00
+            next_status = now + status_poll_interval(&shared);
         }
         if connected && now >= next_poll {
             let interval = Duration::from_millis(shared.hub.read().expect("HubState 锁中毒").poll_interval_ms);
@@ -238,6 +240,16 @@ fn tx_fail_reason(result: &Result<Response, TxError>) -> String {
     }
 }
 
+/// 状态轮询间隔：读界面配置；禁用（0）时退化为 1 秒的重查节拍，以响应重新启用。
+fn status_poll_interval(shared: &SharedState) -> Duration {
+    let ms = shared.hub.read().expect("HubState 锁中毒").status_poll_interval_ms;
+    if ms == 0 {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(ms)
+    }
+}
+
 fn poll_once(
     handle: &tauri::AppHandle,
     shared: &SharedState,
@@ -245,7 +257,7 @@ fn poll_once(
     failures: &mut u32,
 ) {
     // 一轮 = 依次读 7 个通道电流（规范 §7）；全部成功才提交，
-    // 任一事务失败该轮计 1 次失败；通道开关态由设置应答与 3 秒状态轮询同步。
+    // 任一事务失败该轮计 1 次失败；通道开关态由设置应答与状态轮询（间隔可配置）同步。
     let mut currents = [0.0f32; CHANNELS];
     for channel in 1..=CHANNELS as u8 {
         match session.transact(&Command::ReadCurrent { channel }) {

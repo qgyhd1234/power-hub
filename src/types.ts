@@ -27,6 +27,8 @@ export interface HubStatus {
   port: string | null;
   fwVersion: string | null;
   pollIntervalMs: number;
+  /** 状态轮询间隔（毫秒）；0 = 禁用状态轮询 */
+  statusPollIntervalMs: number;
   channels: ChannelStatus[];
   totalPower: number;
   totalCurrent: number;

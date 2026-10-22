@@ -5,11 +5,25 @@ interface OverviewBarProps {
   dark: boolean;
   onThemeToggle: () => void;
   onIntervalChange: (ms: number) => void;
+  onStatusIntervalChange: (ms: number) => void;
 }
 
 const INTERVALS = [250, 500, 1000, 2000];
+/** 0 = 禁用状态轮询 */
+const STATUS_INTERVALS = [0, 500, 1000, 1500, 3000, 6000, 10000];
 
-export default function OverviewBar({ status, dark, onThemeToggle, onIntervalChange }: OverviewBarProps) {
+function statusLabel(ms: number): string {
+  if (ms === 0) return "禁用";
+  return ms === 3000 ? "3s（默认）" : `${ms / 1000}s`;
+}
+
+export default function OverviewBar({
+  status,
+  dark,
+  onThemeToggle,
+  onIntervalChange,
+  onStatusIntervalChange,
+}: OverviewBarProps) {
   const connected = status?.connected ?? false;
   return (
     <header className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-zinc-200 bg-white px-6 py-3 dark:border-zinc-800 dark:bg-zinc-900/80">
@@ -54,6 +68,24 @@ export default function OverviewBar({ status, dark, onThemeToggle, onIntervalCha
             {INTERVALS.map((ms) => (
               <option key={ms} value={ms}>
                 {ms} ms
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label
+          className="flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400"
+          title="状态轮询用于感知手动通道变化；禁用 = 0"
+        >
+          状态
+          <select
+            value={status?.statusPollIntervalMs ?? 3000}
+            onChange={(e) => onStatusIntervalChange(Number(e.target.value))}
+            className="rounded-md border border-zinc-200 bg-zinc-50 px-1.5 py-1 text-xs text-zinc-700 focus:outline-none dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+          >
+            {STATUS_INTERVALS.map((ms) => (
+              <option key={ms} value={ms}>
+                {statusLabel(ms)}
               </option>
             ))}
           </select>

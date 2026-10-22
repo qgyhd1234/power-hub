@@ -50,6 +50,7 @@ export default function App() {
         dark={dark}
         onThemeToggle={() => setDark((d) => !d)}
         onIntervalChange={(ms) => void invoke("set_poll_interval", { ms }).catch(() => {})}
+        onStatusIntervalChange={(ms) => void invoke("set_status_poll_interval", { ms }).catch(() => {})}
       />
 
       {apiError && (
