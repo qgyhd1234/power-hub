@@ -188,8 +188,8 @@ impl MockHub {
                 channels: CHANNELS as u8,
                 switches: self.switches(),
             },
-            Request::SetChannel { channel, on } => {
-                self.channels[(channel - 1) as usize].on = on;
+            Request::SetChannel { index, on } => {
+                self.channels[index as usize].on = on;
                 Response::Switches(self.switches())
             }
             Request::ReadCurrent { channel } => Response::Current {
@@ -255,7 +255,8 @@ mod tests {
         assert_eq!(hub.handle(&[0xA5, 0x00, 0x00]), None, "长度不足");
         assert_eq!(hub.handle(&[0xA5, 0x00, 0x00, 0x00]), None, "包尾不对");
         assert_eq!(hub.handle(&[0xA5, 0x03, 0x00, 0x5A]), None, "未知指令");
-        assert_eq!(hub.handle(&[0xA5, 0x01, 0x00, 0x5A]), None, "设置通道 0");
+        assert_eq!(hub.handle(&[0xA5, 0x01, 0x07, 0x5A]), None, "索引 7 越界");
+        assert_eq!(hub.handle(&[0xA5, 0x01, 0x20, 0x5A]), None, "bit5 置位");
         assert_eq!(hub.handle(&[0xA5, 0x02, 0x08, 0x5A]), None, "读通道 8");
     }
 

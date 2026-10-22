@@ -64,8 +64,9 @@ impl Command {
     pub fn encode(&self) -> [u8; CMD_FRAME_LEN] {
         let (cmd_byte, data) = match *self {
             Self::Handshake => (cmd::HANDSHAKE, 0x00),
+            // 线上为 0 基通道索引（0=通道1，ADR-0006）：领域层 1 基通道号在此减 1
             Self::SetChannel { channel, on } => {
-                (cmd::SET_CHANNEL, channel | if on { 0x10 } else { 0x00 })
+                (cmd::SET_CHANNEL, (channel - 1) | if on { 0x10 } else { 0x00 })
             }
             Self::ReadCurrent { channel } => (cmd::READ_CURRENT, channel),
         };
@@ -77,7 +78,8 @@ impl Command {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Request {
     Handshake,
-    SetChannel { channel: u8, on: bool },
+    /// 通道设置：0 基通道索引（0 = 通道 1）
+    SetChannel { index: u8, on: bool },
     ReadCurrent { channel: u8 },
 }
 
@@ -91,9 +93,9 @@ pub fn parse_request(frame: &[u8]) -> Option<Request> {
         cmd::HANDSHAKE => Some(Request::Handshake), // 数据字节固件忽略
         cmd::SET_CHANNEL => {
             let on = data & 0x10 != 0;
-            let channel = data & 0x0F;
-            (data & 0xE0 == 0 && is_channel(channel))
-                .then_some(Request::SetChannel { channel, on })
+            let index = data & 0x0F;
+            (data & 0xE0 == 0 && index < CHANNELS as u8)
+                .then_some(Request::SetChannel { index, on })
         }
         cmd::READ_CURRENT => (data & 0xF8 == 0 && is_channel(data))
             .then_some(Request::ReadCurrent { channel: data }),
@@ -217,8 +219,11 @@ mod tests {
     #[test]
     fn encode_matches_spec_examples() {
         assert_eq!(Command::Handshake.encode(), [0xA5, 0x00, 0x00, 0x5A]);
-        assert_eq!(Command::set_channel(2, true).unwrap().encode(), [0xA5, 0x01, 0x12, 0x5A]);
-        assert_eq!(Command::set_channel(2, false).unwrap().encode(), [0xA5, 0x01, 0x02, 0x5A]);
+        // 0x01 线上为 0 基索引：开通道1=0x10、开通道7=0x16、关通道7=0x06（ADR-0006）
+        assert_eq!(Command::set_channel(1, true).unwrap().encode(), [0xA5, 0x01, 0x10, 0x5A]);
+        assert_eq!(Command::set_channel(7, true).unwrap().encode(), [0xA5, 0x01, 0x16, 0x5A]);
+        assert_eq!(Command::set_channel(7, false).unwrap().encode(), [0xA5, 0x01, 0x06, 0x5A]);
+        // 0x02 维持 1 基通道号
         assert_eq!(Command::read_current(3).unwrap().encode(), [0xA5, 0x02, 0x03, 0x5A]);
     }
 
@@ -334,12 +339,16 @@ mod tests {
         // 握手数据字节固件忽略
         assert_eq!(parse_request(&[0xA5, 0x00, 0x42, 0x5A]), Some(Request::Handshake));
         assert_eq!(
-            parse_request(&[0xA5, 0x01, 0x12, 0x5A]),
-            Some(Request::SetChannel { channel: 2, on: true })
+            parse_request(&[0xA5, 0x01, 0x10, 0x5A]),
+            Some(Request::SetChannel { index: 0, on: true })
         );
         assert_eq!(
-            parse_request(&[0xA5, 0x01, 0x02, 0x5A]),
-            Some(Request::SetChannel { channel: 2, on: false })
+            parse_request(&[0xA5, 0x01, 0x00, 0x5A]),
+            Some(Request::SetChannel { index: 0, on: false })
+        );
+        assert_eq!(
+            parse_request(&[0xA5, 0x01, 0x16, 0x5A]),
+            Some(Request::SetChannel { index: 6, on: true })
         );
         assert_eq!(
             parse_request(&[0xA5, 0x02, 0x07, 0x5A]),
@@ -353,8 +362,8 @@ mod tests {
         assert_eq!(parse_request(&[0x5A, 0x00, 0x00, 0x5A]), None, "包头不对");
         assert_eq!(parse_request(&[0xA5, 0x00, 0x00, 0x00]), None, "包尾不对");
         assert_eq!(parse_request(&[0xA5, 0x03, 0x00, 0x5A]), None, "未知指令");
-        assert_eq!(parse_request(&[0xA5, 0x01, 0x00, 0x5A]), None, "设置通道 0");
-        assert_eq!(parse_request(&[0xA5, 0x01, 0x08, 0x5A]), None, "设置通道 8");
+        assert_eq!(parse_request(&[0xA5, 0x01, 0x07, 0x5A]), None, "索引 7 越界");
+        assert_eq!(parse_request(&[0xA5, 0x01, 0x08, 0x5A]), None, "索引 8 越界");
         assert_eq!(parse_request(&[0xA5, 0x01, 0x20, 0x5A]), None, "bit5 必须为 0");
         assert_eq!(parse_request(&[0xA5, 0x02, 0x00, 0x5A]), None, "读通道 0");
         assert_eq!(parse_request(&[0xA5, 0x02, 0x08, 0x5A]), None, "读通道 8");
