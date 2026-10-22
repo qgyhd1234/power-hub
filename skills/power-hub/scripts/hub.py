@@ -3,7 +3,8 @@
 
 连接方式自动选择：
 1. 上位机本地 API（http://127.0.0.1:8756，需要上位机在运行且已连接 hub）
-2. 直连串口（pyserial，扫描全部串口握手识别，二进制帧协议）
+2. 直连串口（pyserial，按 CH340 魔术字过滤优先控制口，无命中回退全口
+   握手识别，二进制帧协议）
 
 用法（协议规范见仓库 docs/protocol.md）：
     uv run --with pyserial scripts/hub.py <子命令> [参数]
@@ -18,11 +19,17 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from typing import NamedTuple
 
 API_BASE = "http://127.0.0.1:8756"
 API_HEADERS = {"X-Power-Hub": "v1", "Accept": "application/json"}
 BAUD = 115200
 CHANNELS = 7
+
+# CH340 控制口魔术字（权威定义：src-tauri/src/magic.rs、docs/protocol.md §9）。
+# vid/pid 精确匹配：CH9102（1A86:55D4）、WCH-Link（1A86:8010）等同厂芯片不放行。
+CONTROL_VID = 0x1A86
+CONTROL_PID = 0x7523
 
 # ---------- 二进制帧协议编解码（权威规范：docs/protocol.md） ----------
 
@@ -205,15 +212,52 @@ def is_bluetooth_port(p) -> bool:
     return "bluetooth" in desc or "蓝牙" in desc
 
 
-def all_ports():
-    """返回 (实体口, 蓝牙口)。依赖 pyserial，未安装时抛 ImportError。"""
+def select_control_ports(ports):
+    """CH340 控制口过滤（scan 与握手扫描共用；语义镜像上位机
+    src-tauri/src/serial.rs 的 filter_control_port）。
+
+    已排除蓝牙的候选口按 vid/pid 精确匹配 CH340：命中 → 只留命中口；
+    无命中 → 回退全部候选。返回 (候选口, 是否命中)。
+    非 USB 口 vid/pid 为 None，天然不命中。
+    """
+    hits = [p for p in ports if p.vid == CONTROL_VID and p.pid == CONTROL_PID]
+    return (hits, True) if hits else (ports, False)
+
+
+class ProbeSet(NamedTuple):
+    """一次串口枚举的探测集：候选口、被跳过的蓝牙口、CH340 是否命中。"""
+
+    ports: list  # 候选口（已排除蓝牙；CH340 命中时仅命中口）
+    skipped: list  # 被跳过的蓝牙口
+    matched: bool
+
+
+def close_quietly(transport) -> None:
+    """探测结束收尾：关闭串口，忽略已关闭/设备拔出等异常；None（未成功打开）直接跳过。"""
+    if transport is None:
+        return
+    try:
+        transport.ser.close()
+    except Exception:
+        pass
+
+
+def print_port_filter_note(ports, matched) -> None:
+    """过滤结果一行说明，scan 与握手扫描共用。"""
+    if matched:
+        print(f"  ✓ CH340 控制口命中，只探测：{', '.join(p.device for p in ports)}")
+    else:
+        print(f"  ○ 无 CH340 命中，回退探测全部 {len(ports)} 个候选口")
+
+
+def probe_ports() -> ProbeSet:
+    """枚举系统串口，排除蓝牙并按 CH340 过滤。依赖 pyserial，未安装时抛 ImportError。"""
     import serial.tools.list_ports
 
     all_ = list(serial.tools.list_ports.comports())
-    return (
-        [p for p in all_ if not is_bluetooth_port(p)],
-        [p for p in all_ if is_bluetooth_port(p)],
-    )
+    physical = [p for p in all_ if not is_bluetooth_port(p)]
+    ports, matched = select_control_ports(physical)
+    return ProbeSet(ports, [p for p in all_ if is_bluetooth_port(p)], matched)
 
 
 def find_transport():
@@ -227,28 +271,27 @@ def find_transport():
         api_note = "API 不可达（上位机未运行？）"
 
     try:
-        ports, _ = all_ports()
+        ps = probe_ports()
     except ImportError:
         raise HubError(
             f"{api_note}；直连串口需要 pyserial：uv run --with pyserial scripts/hub.py ..."
         ) from None
 
+    if ps.ports:
+        print_port_filter_note(ps.ports, ps.matched)
+
     errors: list[str] = []
-    for p in ports:
+    for p in ps.ports:
         t = None
         try:
             t = SerialTransport(p.device)
             if t.handshake() is not None:
-                return t
+                return t  # 命中：串口保持打开，供后续命令复用
             errors.append(f"{p.device}: 握手判据未通过")
         except Exception as e:
             errors.append(f"{p.device}: {e}")
-        finally:
-            if t is not None:
-                try:
-                    t.ser.close()
-                except Exception:
-                    pass
+        # 仅探测失败时关闭（勿放 finally：会连成功路径一起关，返回的连接即失效）
+        close_quietly(t)
     detail = "；".join(errors) if errors else "系统无串口"
     raise HubError(f"未找到 hub：{api_note}；串口握手识别失败（{detail}）")
 
@@ -297,16 +340,17 @@ def cmd_scan(_args: argparse.Namespace) -> None:
 
     print("扫描串口 …")
     try:
-        ports, skipped = all_ports()
+        ps = probe_ports()
     except ImportError:
         print("  ! 未安装 pyserial，跳过（uv run --with pyserial …）")
         return
-    for p in skipped:
+    for p in ps.skipped:
         print(f"  - {p.device}（蓝牙口，跳过）")
-    if not ports:
+    if not ps.ports:
         print("  ✗ 无可探测的实体串口")
         return
-    for p in ports:
+    print_port_filter_note(ps.ports, ps.matched)
+    for p in ps.ports:
         t = None
         try:
             t = SerialTransport(p.device)
@@ -315,11 +359,7 @@ def cmd_scan(_args: argparse.Namespace) -> None:
         except Exception as e:
             print(f"  ✗ {p.device}: {e}")
         finally:
-            if t is not None:
-                try:
-                    t.ser.close()
-                except Exception:
-                    pass
+            close_quietly(t)  # scan 只报告不保持连接，逐口关闭
 
 
 def cmd_status(_args: argparse.Namespace) -> None:
