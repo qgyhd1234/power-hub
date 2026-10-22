@@ -79,7 +79,7 @@ pub struct Runtime {
 }
 
 #[tauri::command]
-fn list_ports() -> Vec<String> {
+fn list_ports() -> serial::PortList {
     serial::list_ports()
 }
 
@@ -233,6 +233,20 @@ pub fn run() {
             });
 
             poller::spawn(handle.clone(), shared.clone(), cmd_rx);
+
+            // 启动时枚举一次设备树，连接后即可显示设备（结果同时进日志便于校准）
+            #[cfg(windows)]
+            {
+                let startup_shared = shared.clone();
+                tauri::async_runtime::spawn_blocking(move || match usb::enumerate_channels() {
+                    Ok(map) => {
+                        if let Ok(mut hub) = startup_shared.hub.write() {
+                            hub.devices = map;
+                        }
+                    }
+                    Err(e) => info!("启动设备树枚举未定位到 hub: {e}"),
+                });
+            }
 
             {
                 let shared = shared.clone();

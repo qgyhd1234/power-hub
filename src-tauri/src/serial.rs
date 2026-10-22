@@ -89,13 +89,95 @@ impl SerialSession {
     }
 }
 
-/// 枚举系统可用串口名。
-pub fn list_ports() -> Vec<String> {
+/// 串口条目：名称 + USB 身份（蓝牙等非 USB 口 vid/pid 为 None）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortInfo {
+    pub name: String,
+    pub vid: Option<u16>,
+    pub pid: Option<u16>,
+}
+
+/// 串口列表结果：`filtered = false` 表示 CH340 过滤无命中，已回退展示全部。
+#[derive(Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortList {
+    pub ports: Vec<PortInfo>,
+    pub filtered: bool,
+}
+
+/// 枚举系统串口并按 CH340 魔术字（`magic.rs`）过滤；无命中回退展示全部。
+pub fn list_ports() -> PortList {
+    filter_control_port(enumerate())
+}
+
+fn enumerate() -> Vec<PortInfo> {
     serialport::available_ports()
         .unwrap_or_default()
         .into_iter()
-        .map(|p| p.port_name)
+        // 蓝牙虚拟串口不可能是 hub 控制口，且打开有阻塞风险，始终排除
+        .filter(|p| !matches!(p.port_type, serialport::SerialPortType::BluetoothPort))
+        .map(|p| {
+            let (vid, pid) = match p.port_type {
+                serialport::SerialPortType::UsbPort(info) => (Some(info.vid), Some(info.pid)),
+                _ => (None, None),
+            };
+            PortInfo { name: p.port_name, vid, pid }
+        })
         .collect()
+}
+
+/// 过滤出 CH340 控制口；无命中则原样返回全部（回退策略）。
+fn filter_control_port(all: Vec<PortInfo>) -> PortList {
+    let is_control = |p: &PortInfo| {
+        p.vid == Some(crate::magic::CONTROL_VID) && p.pid == Some(crate::magic::CONTROL_PID)
+    };
+    if all.iter().any(is_control) {
+        PortList { ports: all.into_iter().filter(is_control).collect(), filtered: true }
+    } else {
+        PortList { ports: all, filtered: false }
+    }
+}
+
+#[cfg(test)]
+mod port_filter_tests {
+    use super::*;
+
+    fn port(name: &str, vid: Option<u16>, pid: Option<u16>) -> PortInfo {
+        PortInfo { name: name.into(), vid, pid }
+    }
+
+    #[test]
+    fn keeps_only_ch340_when_present() {
+        let all = vec![
+            port("COM37", Some(0x1A86), Some(0x7523)),
+            port("COM35", Some(0x1A86), Some(0x55D4)), // CH9102，同为 WCH 但不是 CH340
+            port("COM31", Some(0x1A86), Some(0x8010)), // WCH-Link
+            port("COM25", Some(0x0D28), Some(0x0202)),
+        ];
+        let list = filter_control_port(all);
+        assert!(list.filtered);
+        assert_eq!(list.ports, vec![port("COM37", Some(0x1A86), Some(0x7523))]);
+    }
+
+    #[test]
+    fn falls_back_to_all_when_no_ch340() {
+        let all = vec![
+            port("COM35", Some(0x1A86), Some(0x55D4)),
+            port("COM25", Some(0x0D28), Some(0x0202)),
+            port("COM7", None, None),
+        ];
+        let list = filter_control_port(all);
+        assert!(!list.filtered);
+        assert_eq!(list.ports.len(), 3);
+    }
+
+    #[test]
+    fn empty_list_stays_empty_and_unfiltered() {
+        let list = filter_control_port(vec![]);
+        assert!(!list.filtered);
+        assert!(list.ports.is_empty());
+    }
 }
 
 // 写帧依赖 Command::encode 的定长布局，这里把规范帧长锁进编译期。

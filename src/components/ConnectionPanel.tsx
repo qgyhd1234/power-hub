@@ -1,12 +1,20 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { PortInfo, PortList } from "../types";
 
 interface ConnectionPanelProps {
   onConnected: () => void;
 }
 
+function portLabel(p: PortInfo): string {
+  if (p.vid == null || p.pid == null) return p.name;
+  const hex = (n: number) => n.toString(16).toUpperCase().padStart(4, "0");
+  return `${p.name}（${hex(p.vid)}:${hex(p.pid)}）`;
+}
+
 export default function ConnectionPanel({ onConnected }: ConnectionPanelProps) {
-  const [ports, setPorts] = useState<string[]>([]);
+  const [ports, setPorts] = useState<PortInfo[]>([]);
+  const [filtered, setFiltered] = useState(false);
   const [selected, setSelected] = useState<string>("");
   const [scanning, setScanning] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -16,12 +24,13 @@ export default function ConnectionPanel({ onConnected }: ConnectionPanelProps) {
     setScanning(true);
     setError(null);
     try {
-      const list = await invoke<string[]>("list_ports");
-      setPorts(list);
-      if (selectFirst && list.length > 0) {
-        setSelected((cur) => (cur || list[0]));
+      const list = await invoke<PortList>("list_ports");
+      setPorts(list.ports);
+      setFiltered(list.filtered);
+      if (selectFirst && list.ports.length > 0) {
+        setSelected((cur) => cur || list.ports[0].name);
       }
-      if (list.length === 0) {
+      if (list.ports.length === 0) {
         setError("未发现串口设备，请检查 USB 连接");
       }
     } catch (e) {
@@ -76,8 +85,8 @@ export default function ConnectionPanel({ onConnected }: ConnectionPanelProps) {
         >
           {ports.length === 0 && <option value="">（无可用串口）</option>}
           {ports.map((p) => (
-            <option key={p} value={p}>
-              {p}
+            <option key={p.name} value={p.name}>
+              {portLabel(p)}
             </option>
           ))}
         </select>
@@ -104,6 +113,12 @@ export default function ConnectionPanel({ onConnected }: ConnectionPanelProps) {
       >
         没有硬件？进入演示模式 →
       </button>
+
+      {!filtered && ports.length > 0 && (
+        <p className="text-xs text-zinc-400 dark:text-zinc-500">
+          未发现 CH340 串口，已展示全部串口
+        </p>
+      )}
 
       {error && <p className="text-sm text-red-500">{error}</p>}
     </div>

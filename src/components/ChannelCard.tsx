@@ -52,7 +52,7 @@ export default function ChannelCard({ ch, connected, busy, onToggle }: ChannelCa
             </span>
           </div>
         ) : (
-          <p className="text-xs text-zinc-400 dark:text-zinc-600">（空）</p>
+          <p className="text-xs text-zinc-400 dark:text-zinc-600">未识别到设备</p>
         )}
       </div>
     </div>

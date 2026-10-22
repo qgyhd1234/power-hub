@@ -26,6 +26,7 @@ futures-util = "0.3"
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Devices_Properties",
 ] }
 
 [profile.release]

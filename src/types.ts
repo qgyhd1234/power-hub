@@ -6,6 +6,19 @@ export interface DeviceInfo {
   pid: number;
 }
 
+/** 串口条目：蓝牙等非 USB 口 vid/pid 为 null */
+export interface PortInfo {
+  name: string;
+  vid: number | null;
+  pid: number | null;
+}
+
+/** 串口列表结果：filtered=false 表示 CH340 过滤无命中，已回退展示全部 */
+export interface PortList {
+  ports: PortInfo[];
+  filtered: boolean;
+}
+
 export interface ChannelStatus {
   index: number;
   on: boolean;

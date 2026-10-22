@@ -43,6 +43,15 @@ export default function App() {
 
   const connected = status?.connected ?? false;
 
+  // 连接后定期重枚举设备树，插拔设备自动反映到通道卡（枚举是注册表级操作，开销极小）
+  useEffect(() => {
+    if (!connected) return;
+    const refresh = () => void invoke("refresh_devices").catch(() => {});
+    refresh();
+    const timer = setInterval(refresh, 5000);
+    return () => clearInterval(timer);
+  }, [connected]);
+
   return (
     <div className="flex min-h-screen flex-col bg-zinc-100 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
       <OverviewBar
