@@ -6,6 +6,7 @@
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use log::{debug, info, warn};
 use tauri::Emitter;
 use tokio::sync::oneshot;
 
@@ -65,6 +66,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                     match SerialSession::open(&path) {
                         Ok(mut s) => match connect_handshake(&mut s) {
                             Ok((fw, switches)) => {
+                                info!("已连接 {path}（fw=0x{fw:02X}，通道掩码 0x{switches:02X}）");
                                 {
                                     let mut hub = shared.hub.write().expect("HubState 锁中毒");
                                     hub.connected = true;
@@ -82,16 +84,19 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                                 session = Some(Session::Serial(s));
                             }
                             Err(reason) => {
+                                warn!("{path}: {reason}");
                                 let _ = resp.send(Err(format!("{path}: {reason}")));
                             }
                         },
                         Err(e) => {
+                            warn!("打开串口失败：{e}");
                             let _ = resp.send(Err(e));
                         }
                     }
                 }
                 ControlCommand::StartDemo { resp } => {
                     session = Some(Session::Mock(MockHub::new()));
+                    info!("进入演示模式（数据为模拟）");
                     {
                         let mut hub = shared.hub.write().expect("HubState 锁中毒");
                         hub.connected = true;
@@ -116,10 +121,17 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                     }
                     Some(s) => {
                         let result = match Command::set_channel(ch, on) {
-                            None => Err("通道号范围 1~7".into()),
+                            None => {
+                                warn!("非法通道号 {ch}（应为 1~7）");
+                                Err("通道号范围 1~7".into())
+                            }
                             Some(command) => match s.transact(&command) {
                                 // 应答掩码即动作执行后的全通道状态（规范 §4.2）
                                 Ok(Response::Switches(mask)) => {
+                                    info!(
+                                        "通道 {ch} → {}（状态掩码 0x{mask:02X}）",
+                                        if on { "开" } else { "关" }
+                                    );
                                     {
                                         let mut hub = shared.hub.write().expect("HubState 锁中毒");
                                         apply_switches(&mut hub.telemetry, mask);
@@ -129,8 +141,11 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                                     next_poll = Instant::now();
                                     Ok(())
                                 }
-                                Ok(_) => Err("hub 应答异常".into()),
-                                Err(e) => Err(e.to_string()),
+                                other => {
+                                    let reason = tx_fail_reason(&other);
+                                    warn!("通道 {ch} 设置失败：{reason}");
+                                    Err(reason)
+                                }
                             },
                         };
                         let _ = resp.send(result);
@@ -145,6 +160,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
             let interval = Duration::from_millis(shared.hub.read().expect("HubState 锁中毒").poll_interval_ms);
             poll_once(&handle, &shared, session.as_mut().expect("connected"), &mut failures);
             if failures >= MAX_CONSECUTIVE_FAILURES {
+                warn!("连续 {MAX_CONSECUTIVE_FAILURES} 轮轮询失败，判定断连");
                 session = None;
                 mark_disconnected(&shared);
             }
@@ -154,13 +170,17 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
             // 演示模式的设备表随每轮轮询注入（见 poll_once），不走系统枚举
             if matches!(session, Some(Session::Serial(_))) {
                 #[cfg(windows)]
-                if let Ok(map) = crate::usb::enumerate_channels() {
-                    let mut hub = shared.hub.write().expect("HubState 锁中毒");
-                    if hub.devices != map {
-                        hub.devices = map;
-                        drop(hub);
-                        state::notify(&shared);
+                match crate::usb::enumerate_channels() {
+                    Ok(map) => {
+                        let mut hub = shared.hub.write().expect("HubState 锁中毒");
+                        if hub.devices != map {
+                            hub.devices = map;
+                            drop(hub);
+                            state::notify(&shared);
+                        }
                     }
+                    // 2 秒一响，放 Debug 防刷屏
+                    Err(e) => debug!("USB 设备树枚举失败：{e}"),
                 }
             }
             next_usb = now + USB_REFRESH;
@@ -186,6 +206,14 @@ fn apply_switches(telemetry: &mut [ChannelTelemetry; CHANNELS], mask: u8) {
     }
 }
 
+/// 把一次事务结果归一成给人看的失败原因（非法应答 / 超时 / IO）。
+fn tx_fail_reason(result: &Result<Response, TxError>) -> String {
+    match result {
+        Ok(_) => "应答指令异常".into(),
+        Err(e) => e.to_string(),
+    }
+}
+
 fn poll_once(
     handle: &tauri::AppHandle,
     shared: &SharedState,
@@ -200,13 +228,15 @@ fn poll_once(
             Ok(Response::Current { channel: ch, ma }) if ch == channel => {
                 currents[(ch - 1) as usize] = ma;
             }
-            _ => {
+            other => {
+                warn!("读通道 {channel} 电流失败：{}，本轮中止", tx_fail_reason(&other));
                 *failures += 1;
                 return;
             }
         }
     }
     *failures = 0;
+    debug!("一轮轮询完成，电流（mA）：{currents:?}");
     {
         let mut hub = shared.hub.write().expect("HubState 锁中毒");
         hub.connected = true;

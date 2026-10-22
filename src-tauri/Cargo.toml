@@ -13,6 +13,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 power-hub-protocol = { path = "crates/protocol" }
 tauri = { version = "2", features = [] }
+tauri-plugin-log = "2"
+log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serialport = "4"

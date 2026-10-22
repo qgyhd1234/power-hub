@@ -3,6 +3,8 @@
 use std::io;
 use std::time::{Duration, Instant};
 
+use log::debug;
+
 use crate::protocol::{extract_response, Command, Response};
 
 pub const BAUD: u32 = 115_200;
@@ -45,6 +47,8 @@ impl SerialSession {
     pub fn transact(&mut self, command: &Command) -> Result<Response, TxError> {
         self.buf.clear();
         let frame = command.encode();
+        // 原始帧收发十六进制 dump（Debug 级，spec `.scratch/power-hub-logs/`）
+        debug!("串口 → {:02X?}", frame);
         let mut out: &[u8] = &frame;
         while !out.is_empty() {
             match self.port.write(out) {
@@ -58,7 +62,17 @@ impl SerialSession {
 
         let deadline = Instant::now() + READ_TIMEOUT;
         loop {
+            // Debug 级下快照接收缓冲：除重建帧外，把失步被丢弃的字节也暴露给联调
+            let raw = if log::log_enabled!(log::Level::Debug) {
+                Some(self.buf.clone())
+            } else {
+                None
+            };
             if let Some(resp) = extract_response(&mut self.buf) {
+                debug!("串口 ← {:02X?}", resp.encode());
+                if let Some(raw) = raw {
+                    debug!("串口 ← 线上缓冲（含失步丢弃字节）: {:02X?}", raw);
+                }
                 return Ok(resp);
             }
             if Instant::now() >= deadline {

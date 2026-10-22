@@ -12,6 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use log::info;
 use tokio::sync::oneshot;
 
 use crate::magic;
@@ -35,6 +36,7 @@ pub async fn serve(shared: SharedState, cmd_tx: Sender<ControlCommand>) -> Resul
     let listener = tokio::net::TcpListener::bind(magic::API_ADDR)
         .await
         .map_err(|e| format!("绑定 {} 失败: {e}", magic::API_ADDR))?;
+    info!("本地 API 监听 {}", magic::API_ADDR);
     axum::serve(listener, app)
         .await
         .map_err(|e| format!("本地 API 服务异常: {e}"))
