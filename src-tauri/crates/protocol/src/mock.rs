@@ -232,8 +232,17 @@ mod tests {
     #[test]
     fn full_flow_handshake_set_read() {
         let mut hub = MockHub::new();
-        // 握手 → 关通道 1 → 读通道 1 电流为 0，读通道 2 有设备电流 > 0
+        // 握手 → 关/开通道1（掩码锁定 0 基索引映射）→ 读电流
         assert!(ask(&mut hub, &cmd_frame(&Command::Handshake)).is_valid_handshake());
+        assert_eq!(
+            ask(&mut hub, &cmd_frame(&Command::set_channel(1, false).unwrap())),
+            Response::Switches(0x7E)
+        );
+        assert_eq!(
+            ask(&mut hub, &cmd_frame(&Command::set_channel(1, true).unwrap())),
+            Response::Switches(0x7F),
+            "开通道1 → 掩码 bit0"
+        );
         assert_eq!(
             ask(&mut hub, &cmd_frame(&Command::set_channel(1, false).unwrap())),
             Response::Switches(0x7E)

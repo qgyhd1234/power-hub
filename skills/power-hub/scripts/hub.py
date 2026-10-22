@@ -189,6 +189,8 @@ class SerialTransport:
 
     def set_channel(self, ch: int, on: bool) -> None:
         """0x01 通道设置：低 4 位 = 0 基通道索引（0=通道1）+ bit4 开关；应答首字节为切换后 7 位通道掩码。"""
+        if not 1 <= ch <= 7:
+            raise HubError("通道号范围 1~7")
         resp = self._transact(CMD_CHANNEL, (ch - 1) | (0x10 if on else 0x00))
         if resp is None:
             raise HubError(f"{self.port_name} 通道设置无应答")

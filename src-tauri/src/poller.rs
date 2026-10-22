@@ -19,6 +19,8 @@ use power_hub_protocol::mock::{DemoDevice, MockHub, DEMO_FW};
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// 设备树枚举节流周期。
 const USB_REFRESH: Duration = Duration::from_secs(2);
+/// 状态轮询周期：hub 无主动上报，周期 0x00 感知手动控制等带外变化（protocol.md §4.1）。
+const STATUS_POLL: Duration = Duration::from_secs(3);
 
 /// 与 hub 的会话：真实串口或演示模式（ADR-0004）。
 enum Session {
@@ -57,6 +59,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
     let mut session: Option<Session> = None;
     let mut failures = 0u32;
     let mut next_poll = Instant::now();
+    let mut next_status = Instant::now();
     let mut next_usb = Instant::now();
 
     loop {
@@ -78,6 +81,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                                 }
                                 failures = 0;
                                 next_poll = Instant::now();
+                                next_status = Instant::now() + STATUS_POLL;
                                 state::notify(&shared);
                                 emit(&handle, &shared);
                                 let _ = resp.send(Ok(Some(format!("0x{fw:02X}"))));
@@ -106,6 +110,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                     }
                     failures = 0;
                     next_poll = Instant::now();
+                    next_status = Instant::now() + STATUS_POLL;
                     state::notify(&shared);
                     emit(&handle, &shared);
                     let _ = resp.send(Ok(()));
@@ -132,12 +137,7 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
                                         "通道 {ch} → {}（状态掩码 0x{mask:02X}）",
                                         if on { "开" } else { "关" }
                                     );
-                                    {
-                                        let mut hub = shared.hub.write().expect("HubState 锁中毒");
-                                        apply_switches(&mut hub.telemetry, mask);
-                                    }
-                                    state::notify(&shared);
-                                    emit(&handle, &shared);
+                                    commit_switches(&handle, &shared, mask);
                                     next_poll = Instant::now();
                                     Ok(())
                                 }
@@ -156,15 +156,29 @@ fn run(handle: tauri::AppHandle, shared: SharedState, cmd_rx: Receiver<ControlCo
 
         let now = Instant::now();
         let connected = session.is_some();
+        if connected && now >= next_status {
+            match session.as_mut().expect("connected").transact(&Command::Handshake) {
+                Ok(resp @ Response::Handshake { switches, .. }) if resp.is_valid_handshake() => {
+                    failures = 0;
+                    commit_switches(&handle, &shared, switches);
+                }
+                _ => {
+                    warn!("状态轮询失败，计 1 次失败");
+                    failures += 1;
+                }
+            }
+            next_status = now + STATUS_POLL;
+        }
         if connected && now >= next_poll {
             let interval = Duration::from_millis(shared.hub.read().expect("HubState 锁中毒").poll_interval_ms);
             poll_once(&handle, &shared, session.as_mut().expect("connected"), &mut failures);
-            if failures >= MAX_CONSECUTIVE_FAILURES {
-                warn!("连续 {MAX_CONSECUTIVE_FAILURES} 轮轮询失败，判定断连");
-                session = None;
-                mark_disconnected(&shared);
-            }
             next_poll = Instant::now() + interval;
+        }
+        if connected && failures >= MAX_CONSECUTIVE_FAILURES {
+            warn!("连续 {MAX_CONSECUTIVE_FAILURES} 次轮询失败，判定断连");
+            session = None;
+            mark_disconnected(&shared);
+            emit(&handle, &shared);
         }
         if now >= next_usb {
             // 演示模式的设备表随每轮轮询注入（见 poll_once），不走系统枚举
@@ -206,6 +220,16 @@ fn apply_switches(telemetry: &mut [ChannelTelemetry; CHANNELS], mask: u8) {
     }
 }
 
+/// 把开关掩码写入共享状态并推送 UI（通道设置应答与 3 秒状态轮询共用）。
+fn commit_switches(handle: &tauri::AppHandle, shared: &SharedState, switches: u8) {
+    {
+        let mut hub = shared.hub.write().expect("HubState 锁中毒");
+        apply_switches(&mut hub.telemetry, switches);
+    }
+    state::notify(shared);
+    emit(handle, shared);
+}
+
 /// 把一次事务结果归一成给人看的失败原因（非法应答 / 超时 / IO）。
 fn tx_fail_reason(result: &Result<Response, TxError>) -> String {
     match result {
@@ -221,7 +245,7 @@ fn poll_once(
     failures: &mut u32,
 ) {
     // 一轮 = 依次读 7 个通道电流（规范 §7）；全部成功才提交，
-    // 任一事务失败该轮计 1 次失败，通道开关态由握手/设置应答维护、不单独轮询。
+    // 任一事务失败该轮计 1 次失败；通道开关态由设置应答与 3 秒状态轮询同步。
     let mut currents = [0.0f32; CHANNELS];
     for channel in 1..=CHANNELS as u8 {
         match session.transact(&Command::ReadCurrent { channel }) {
