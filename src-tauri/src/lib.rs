@@ -305,7 +305,7 @@ mod log_support_tests {
         let blocker = root.join("not-a-dir");
         std::fs::write(&blocker, b"x").unwrap();
         let resolved = resolve_app_dir(Some(blocker), Some(root.clone()), root.join("tmp"));
-        assert_eq!(resolved, root.join("data").join("dev.powerhub.app"));
+        assert_eq!(resolved, root.join(APP_IDENTIFIER));
         assert!(resolved.is_dir());
     }
 

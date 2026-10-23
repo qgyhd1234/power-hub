@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 版本闸门（tag 必须等于 tauri.conf.json 版本）
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CONF_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "$TAG_VERSION" != "$CONF_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 tauri.conf.json 版本 ${CONF_VERSION} 不一致"
+            exit 1
+          fi
+          echo "版本校验通过：v$TAG_VERSION"
+
+      - name: 构建便携 exe（不出安装包）
+        run: |
+          npm ci
+          npm run tauri build -- --no-bundle
+
+      # 便携包四件套：exe + WebView2Loader.dll（exe 动态链接，缺了起不来）+ 两份调试资产
+      - name: 装配 zip（文件平铺，不带顶层目录）
+        shell: bash
+        run: |
+          mkdir -p dist/power-hub
+          cp src-tauri/target/release/power-hub.exe dist/power-hub/
+          cp src-tauri/WebView2Loader.dll dist/power-hub/
+          cp docs/调试.bat dist/power-hub/
+          cp "docs/调试说明.txt" dist/power-hub/
+          # 7z 为 windows-latest 预装；在目录内打包使 zip 根即为四件文件
+          cd dist/power-hub
+          7z a "../../power-hub_${GITHUB_REF_NAME}_x64.zip" .
+
+      - name: 创建 Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          files: power-hub_*_x64.zip
+          body: |
+            ## 本版变更
+
+            - （发布前在此手写本版要点）
+
+            ## 下载
+
+            下载 `power-hub_${{ github.ref_name }}_x64.zip`，解压后运行 `power-hub.exe`。
+
+            **包内四件**：power-hub.exe、WebView2Loader.dll（运行必需，请与 exe 放同一目录）、调试.bat、调试说明.txt。
+
+            ## 系统要求
+
+            - Windows 10 / 11（x64）
+            - WebView2 Runtime（Win10/11 一般系统自带；缺失时从微软官网安装）
+
+            ## 已知提示
+
+            - 未做代码签名，首次运行 SmartScreen 可能提示"未知发布者"，点"更多信息 → 仍要运行"即可。
+            - 出问题时双击包内 `调试.bat` 启动以记录详细日志，按 `调试说明.txt` 反馈。

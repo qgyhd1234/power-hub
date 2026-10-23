@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Cargo check（全 workspace）
+        run: cargo check --locked --workspace
+        working-directory: src-tauri
+
+      # 主 crate 测试在 MSVC 上预期可用（本机失败为 GNU 工具链限制）。
+      # 若 CI 上因 WebView2Loader/工具链类环境原因失败（非断言失败），
+      # 收窄为 `cargo test --locked -p power-hub-protocol`，主 crate 保留上面的 check 覆盖。
+      - name: Rust 测试（全 workspace）
+        run: cargo test --locked --workspace
+        working-directory: src-tauri
+
+      - name: rustfmt（观察模式，暂不阻塞）
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+        working-directory: src-tauri
+
+      - name: clippy（观察模式，暂不阻塞）
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
+        working-directory: src-tauri
+
+      - name: 前端构建
+        run: |
+          npm ci
+          npm run build
+
+      - name: Tauri 完整构建（提前暴露打包层问题）
+        run: npm run tauri build
