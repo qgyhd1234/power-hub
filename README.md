@@ -2,7 +2,15 @@
 
 USB Hub 电源管理与可视化上位机：对 1 转 7 USB3.0 Hub 的 7 个通道做独立电源控制与实时遥测。
 
-<img src="power_hub.jpg" width="640" alt="power-hub 实物：白色外壳内 PCB 带 LCD 屏，正面 7 个 USB-A 通道口，左侧电源输入与级联口" />
+<p align="center">
+  <img src="power_hub_page.png" width="640" alt="power-hub 上位机界面：演示模式下 7 个通道的电压 / 电流 / 功率遥测卡片与迷你曲线，顶部为总功率、总电流、在线设备与轮询配置" />
+</p>
+
+适配的 hub 主控为 TI TUSB8041（高速 / SuperSpeed 双半树），控制串口为 CH340。
+
+<p align="center">
+  <img src="power_hub.jpg" width="640" alt="power-hub 实物：白色外壳内 PCB 带 LCD 屏，正面 7 个 USB-A 通道口，左侧电源输入与级联口" />
+</p>
 
 ## 功能特性
 
@@ -34,10 +42,6 @@ npm run tauri build    # 打包（产物在 src-tauri/target/）
 ## AI 技能
 
 [skills/power-hub/](skills/power-hub/SKILL.md) 是面向 AI 代理（ZCode / Claude 等）的控制技能：`scan / status / on / off / cycle / watch`。优先走本地 API，不可用时直连串口（pyserial，按 CH340 控制口过滤）。
-
-## 硬件适配档案
-
-hub 主控为 TI TUSB8041（高速 / SuperSpeed 双半树），控制串口为 CH340；实测 VID/PID 魔术字集中维护在 `src-tauri/src/magic.rs`，设备树枚举适配见 `src-tauri/src/usb.rs`。
 
 ## 仓库导览
 
